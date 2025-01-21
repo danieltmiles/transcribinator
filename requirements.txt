@@ -1,0 +1,15 @@
+fastapi
+aiofiles
+python-multipart
+uvicorn[standard]
+torch
+torchvision
+speechbrain==0.5.16
+scikit-learn
+openai-whisper
+soundfile
+pydub
+pydub-ffmpeg-wav
+anyio
+transformers
+optimum

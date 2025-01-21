@@ -1,0 +1,6 @@
+venv
+uploads
+transcriptions.db
+pretrained_models
+.idea
+*.pyc
