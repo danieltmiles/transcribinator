@@ -13,3 +13,9 @@ pydub-ffmpeg-wav
 anyio
 transformers
 optimum
+auto-gptq
+# libosa
+pytest
+pytest-asyncio
+pytest-mock
+webrtcvad

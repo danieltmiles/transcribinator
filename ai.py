@@ -1,4 +1,6 @@
 import asyncio
+import json
+import time
 from io import StringIO
 
 import torch
@@ -92,6 +94,7 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
     if signal.shape[0] > 1:
         signal = torch.mean(signal, dim=0, keepdim=True)
     signal = signal.squeeze()
+    start = time.time()
     print("Loading models...")
     device = "cpu"
     if torch.cuda.is_available():
@@ -110,7 +113,9 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
         raise ImportError(
             "Error loading Whisper model. Please ensure you have openai-whisper installed, not whisper"
         )
+    end = time.time()
     await asyncio.sleep(0.1)
+    print(f"loaded models in {end - start} seconds")
 
     # Parameters for segmentation
     window_size = int(sr * min_segment_length * 3)  # 3x min_segment_length windows
@@ -146,13 +151,13 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
     # Process segments with speaker labels and transcription
     raw_segments = []
     import os
-    import soundfile as sf
-    temp_dir = "temp_segments"
-    os.makedirs(temp_dir, exist_ok=True)
+    # temp_dir = "temp_segments"
+    # os.makedirs(temp_dir, exist_ok=True)
     
     print(f"Transcribing {len(segments)} segments...")
     last_progress = 0
     await asyncio.sleep(0.1)
+    results = []
     for i, segment in tqdm.tqdm(enumerate(segments), total=len(segments)):
         current_progress = int((i / len(segments)) * 100)
         if current_progress > last_progress:
@@ -161,14 +166,38 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
             last_progress = current_progress
         speaker = f"Speaker_{labels[i]}"
         
-        temp_file = os.path.join(temp_dir, f"segment_{i}.wav")
-        sf.write(temp_file, segment['audio'].numpy(), sr)
+        # temp_file = os.path.join(temp_dir, f"segment_{i}.wav")
+        # sf.write(temp_file, segment['audio'].numpy(), sr)
 
-        await asyncio.sleep(0.1)
-        result = whisper_model.transcribe(temp_file)
-        text = result["text"].strip()
-        
-        os.remove(temp_file)
+        if i % 10 == 0:
+            await asyncio.sleep(0.1)
+        result = whisper_model.transcribe(
+            segment['audio'],
+            temperature=0.2,  # Low temperature. Conservative, but small creative freedom
+            language='en',      # Explicitly specify English
+            # initial_prompt="Um, uh, and other hesitation sounds should be transcribed as such.",
+            word_timestamps=True,
+        )
+        text = ""
+        for segment_segment in result.get("segments", []):
+            segment_words = segment_segment.get("words", [])
+            for j, word in enumerate(segment_words):
+                word_word = word.get("word", "")
+                probability = word.get("probability", 0.0)
+                word_duration = word["end"] - word["start"]
+                if word_duration < 0.1:
+                    continue
+                # if this is the first or last word in the segment and it is unusually
+                # short, there is a chance it has been cut off in the middle and we
+                # should allow our overlapping to pick it up in its entirity in a different
+                # segment.
+                if word_duration < 0.25 and (j == 0 or j == len(segment_words) - 1):
+                    probability *= 0.5
+                if probability > 0.3:
+                    text += word_word
+        text = text.strip()
+
+        # os.remove(temp_file)
         
         if text:  # Only add segments with text
             raw_segments.append({
@@ -177,12 +206,16 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
                 'end': segment['end'],
                 'text': text
             })
+            results.append(result)
+    with open("results.json", "w") as fl:
+        json.dump(results, fl, indent=4)
     
     # Merge segments from the same speaker and clean overlapping text
     transcript = []
     current_speaker = None
     current_texts = []
     current_start = None
+
     
     for segment in raw_segments:
         if segment['speaker'] != current_speaker:
@@ -213,11 +246,12 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
             })
     
     # Clean up temp directory
-    os.rmdir(temp_dir)
+    # os.rmdir(temp_dir)
 
     await progress_send_stream.send(100)
     await transcript_send_stream.send(produce_transcript(transcript))
     LOGGER.info(f"{transcript}")
+
     return transcript
 
 def save_transcript(transcript, output_file):

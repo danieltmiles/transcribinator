@@ -4,11 +4,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
 
-# MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8"
-MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct-GPTQ-Int8"
+MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8"
+# MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct-GPTQ-Int8"
+# MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+# MODEL_NAME = "Qwen/Qwen1.5-4B-Chat"
+# MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct-GPTQ-Int8"
 
 class LLMTranscriptCleaner:
-    def __init__(self, model_name=MODEL_NAME, device="cuda" if torch.cuda.is_available() else "cpu"):
+    def __init__(self, model_name=MODEL_NAME, device="cuda" if torch.cuda.is_available() else "cpu", low_cpu_mem_usage=True):
         """
         Initialize the transcript cleaner with an LLM model.
         
@@ -19,7 +22,8 @@ class LLMTranscriptCleaner:
         self.device = device
         # Initialize the model and tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True).to(device)
+        self.model = AutoModelForCausalLM.from_pretrained(
+                model_name, trust_remote_code=True, low_cpu_mem_usage=low_cpu_mem_usage).to(device)
         
         # Basic cleanup patterns for pre-processing
         self.basic_patterns = [
@@ -35,27 +39,51 @@ class LLMTranscriptCleaner:
 
     def _create_prompt(self, text: str) -> str:
         """Create a prompt for the LLM that encourages journalistic-style cleanup."""
-        return f"""As a professional transcriptionist, clean up the following spoken text to make it more readable while maintaining its meaning. Remove speech disfluencies, false starts, and filler words. Format numbers and dates consistently. Maintain the speaker's language as closely as possible but make it flow naturally as if they had written it, not spoken it.".
+        return f"""As a professional transcriptionist, clean up the following spoken text while preserving its exact meaning and the speaker's style of expression. Your task is to:
+
+1. Remove only pure disfluencies like 'uh', 'um', repeated words, and false starts
+2. Remove excessive punctuation like '...' and normalize spacing and grammar
+3. Remove repeated words or phrases that could be due to a damaged recording
+4. Keep all hedging phrases, qualifiers, and expressions of uncertainty (like 'I think', 'I believe', 'probably', 'maybe')
+5. Keep all parenthetical expressions and asides
+6. Format numbers and dates consistently
+7. Preserve the exact meaning and level of certainty expressed by the speaker
 
 Original text: {text}
 
-Cleaned text:"""
+Cleaned text: """
 
-    def _process_with_llm(self, text: str) -> str:
+    def _process_with_llm(self, text: str, prompt_template) -> str:
         """Process the text using the LLM."""
         prompt = self._create_prompt(text)
         
         # Tokenize and generate
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        # Calculate appropriate max length based on input
+        test_encoding = self.tokenizer(prompt, return_tensors="pt")
+        prompt_length = test_encoding.input_ids.size(1)
+        max_length = min(prompt_length + 200, 32000)  # Add buffer, cap at model's context window
+
+        encoded = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+        )
+
+        # Create attention mask (1 for real tokens, 0 for padding)
+        attention_mask = encoded['attention_mask'].to(self.device)
+
         outputs = self.model.generate(
-            inputs.input_ids,
+            encoded.input_ids.to(self.device),
+            attention_mask=attention_mask,
             max_new_tokens=len(text) + 50,  # Allow some buffer for expanded text
-            temperature=0.3,  # Lower temperature for more consistent outputs
+            temperature=0.15,  # Lower temperature for more consistent outputs
             do_sample=True,
             top_p=0.9,
             repetition_penalty=1.2
         )
-        
+
         # Decode and extract the cleaned text
         full_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
         # Extract just the cleaned portion after our prompt
@@ -105,15 +133,11 @@ class BatchTranscriptCleaner:
 if __name__ == "__main__":
     # Test cases that demonstrate various speech patterns
     test_cases = [
-        "twenty twenty uh five twenty twenty five like you know",
-        "the the way forward um I mean the path ahead",
-        "we need to uh we need to focus on on the main issues",
-        "December twenty third two thousand and uh twenty three",
-        "they invested fifty uh thousand I mean five hundred thousand dollars"
+        "And... Ruth believe joined a year A year or two after that, some people are surprised to know that I have... never joined. because I we moved here to Fort Collins, when I was visiting faculty member, at the business school. CSU. and I had already known that there was lot of emotion. -based decision. making going on. on and the Dean had asked me to undertake a couple of kind of kind of politicized initiatives. And so the... So last thing I wanted to do was to... get things further. complicated by some religious organization. and the The winds have blown. various directions. in the couple of decades. since. I'm still in a state of mild state mild tension with part of what goes on in the congregation. you know, uncomfortable. I'm comfortable with where I am. and I'm delighted with where Ruth is. in the relationship. and so that's where we",
     ]
     
     # Initialize the cleaner with a small model for testing
-    cleaner = LLMTranscriptCleaner(model_name=MODEL_NAME)
+    cleaner = LLMTranscriptCleaner(model_name=MODEL_NAME, low_cpu_mem_usage=True)
     batch_cleaner = BatchTranscriptCleaner(cleaner)
     
     # Process test cases
