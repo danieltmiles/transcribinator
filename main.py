@@ -11,6 +11,7 @@ import aiofiles
 import logging
 from typing import Dict, Optional
 
+from fastapi.params import Body
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
 
@@ -399,6 +400,43 @@ async def get_job_status(job_id: str):
     }
 
 
+@app.get("/jobs/{job_id}/speakers")
+async def get_job_speakers(job_id: str):
+    conn = create_connection()
+    if conn:
+        try:
+            c = conn.cursor()
+            c.execute('SELECT transcript FROM transcription_jobs WHERE job_id = ?', (job_id,))
+            transcript = c.fetchone()[0]
+            speakers = re.findall(r"\[.+\] (.+):", transcript)
+            speakers_in_order = []
+            for speaker in speakers:
+                if speaker not in speakers_in_order:
+                    speakers_in_order.append(speaker)
+            return speakers_in_order
+        finally:
+            conn.close()
+
+
+@app.post("/jobs/{job_id}/speakers")
+async def update_job_speakers(job_id: str, updated_speakers: dict[str, str] = Body(...)):
+    conn = create_connection()
+    if conn:
+        try:
+            c = conn.cursor()
+            c.execute('SELECT transcript FROM transcription_jobs WHERE job_id = ?', (job_id,))
+            transcript = c.fetchone()[0]
+            for old_speaker, new_speaker in updated_speakers.items():
+                transcript = re.sub(old_speaker, new_speaker, transcript)
+            c.execute('UPDATE transcription_jobs SET transcript = ? WHERE job_id = ?', (transcript, job_id))
+            conn.commit()
+            return {"transcript": transcript}
+        finally:
+            conn.close()
+    else:
+        raise HTTPException(status_code=404)
+
+
 # Optional: Cleanup endpoint for development
 @app.post("/cleanup")
 async def cleanup_jobs():
@@ -503,6 +541,7 @@ async def upload_file(
         user: User = Depends(get_current_user)):
     # Your existing upload code here
     pass
+
 
 
 
