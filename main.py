@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from logging import Logger
 
 from anyio import create_task_group, create_memory_object_stream
-from fastapi import FastAPI, WebSocket, UploadFile, File, BackgroundTasks, Form
+from fastapi import FastAPI, WebSocket, UploadFile, File, BackgroundTasks, Form, Depends, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 import asyncio
@@ -11,12 +11,30 @@ import aiofiles
 import logging
 from typing import Dict, Optional
 
-from starlette.responses import FileResponse
+from fastapi.templating import Jinja2Templates
+from pathlib import Path
+
+templates = Jinja2Templates(directory="templates")
+
+# Move your template files to a templates directory
+template_dir = Path("templates")
+template_dir.mkdir(exist_ok=True)
+
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import bcrypt
+from jose import jwt
+from datetime import datetime, timedelta
+from pydantic import BaseModel
+import sqlite3
+
+from starlette.responses import FileResponse, JSONResponse, RedirectResponse
 from starlette.websockets import WebSocketState
 
 from ai import process_audio as ai_process_audio
 from dao import save_transcription, init_db, get_jobs, update_job_status, create_connection
 from utils import TranscriptionJob
+
+import re
 
 from starlette.websockets import WebSocketDisconnect
 
@@ -24,8 +42,18 @@ from starlette.websockets import WebSocketDisconnect
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.error("lifespan")
+    # Load the ML model
+    init_db()
+    init_auth_db()
+    yield
+
+
 # Initialize FastAPI app
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 # Enable CORS
 app.add_middleware(
@@ -41,12 +69,39 @@ app.add_middleware(
 active_jobs: Dict[str, TranscriptionJob] = {}
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Load the ML model
-    init_db()
-    active_jobs.update(get_jobs())
-    yield
+class CustomHTTPBearer(HTTPBearer):
+    async def __call__(self, request: Request) -> Optional[HTTPAuthorizationCredentials]:
+        logger.error("http bearer call")
+        # Define paths that don't require authentication
+        open_paths = {"/login", "/auth/login"}
+        if request.url.path in open_paths:
+            return None
+        if re.match(r"^/ws.*", request.url.path):
+            return None
+        logger.error(request.url.path)
+
+        # First check for cookie
+        authorization = request.cookies.get("Authorization")
+
+        # If no cookie, try header (for API calls)
+        if not authorization:
+            try:
+                return await super().__call__(request)
+            except HTTPException:
+                raise HTTPException(
+                    status_code=307,
+                    detail="Not authenticated",
+                    headers={"Location": "/login"}
+                )
+        return HTTPAuthorizationCredentials(
+            scheme="Bearer",
+            credentials=authorization.replace("Bearer ", "")
+        )
+
+# Update the security instance
+security = CustomHTTPBearer(auto_error=True)
+SECRET_KEY = "31220446b6b9e0d7c663e212b33782b1f58ea19b58ccac50f3b7d38b7497fa0b"  # Change this to a secure secret key
+ALGORITHM = "HS256"
 
 
 # Create uploads directory if it doesn't exist
@@ -77,27 +132,36 @@ async def process_audio(job_id: str, file_path: Path, num_speakers: int):
         # transcript = model.transcribe(str(file_path))
         progress_send_stream, progress_receive_stream = create_memory_object_stream[int]()
         transcript_send_stream, transcript_receive_stream = create_memory_object_stream[str]()
-        async with create_task_group() as tg:
-            tg.start_soon(ai_process_audio, file_path, num_speakers, 1.0, progress_send_stream, transcript_send_stream)
-            #progress: int = await progress_receive_stream.receive()
-            progress: int = 0
-            while progress < 100:
-                job = active_jobs[job_id]
-                if job and job.websocket and job.websocket.client_state == WebSocketState.CONNECTED:
-                    try:
-                        await job.websocket.send_json({
-                            "type": "progress",
-                            "progress": progress,
-                            "stage": "Transcribing audio"
-                        })
-                    except WebSocketDisconnect:
-                        logger.error("web socket has disconnected")
-                        active_jobs[job_id] = None
-                else:
-                    logger.info("no websocket, not sending progress")
-                progress = await progress_receive_stream.receive()
-            transcript = await transcript_receive_stream.receive()
-            update_job_status(job_id, "completed", transcript)
+        # def handle_tgerror(excgroup: ExceptionGroup) -> None:
+        #     for exc in excgroup.exceptions:
+        #         print(exc)
+        #     raise exc
+        try:
+            async with create_task_group() as tg:
+                tg.start_soon(ai_process_audio, file_path, num_speakers, 1.0, progress_send_stream, transcript_send_stream)
+                #progress: int = await progress_receive_stream.receive()
+                progress: int = 0
+                while progress < 100:
+                    job = active_jobs[job_id]
+                    if job and job.websocket and job.websocket.client_state == WebSocketState.CONNECTED:
+                        try:
+                            await job.websocket.send_json({
+                                "type": "progress",
+                                "progress": progress,
+                                "stage": "Transcribing audio"
+                            })
+                        except WebSocketDisconnect:
+                            logger.error("web socket has disconnected")
+                            active_jobs[job_id] = None
+                    else:
+                        logger.info("no websocket, not sending progress")
+                    progress = await progress_receive_stream.receive()
+                transcript = await transcript_receive_stream.receive()
+                update_job_status(job_id, "completed", transcript)
+        except* Exception as excgroup:
+            for exc in excgroup.exceptions:
+                print(exc)
+            raise exc
 
         # Update job with transcript
         job.transcript = transcript
@@ -134,50 +198,134 @@ async def process_audio(job_id: str, file_path: Path, num_speakers: int):
         except Exception as e:
             logger.error(f"Error deleting file {file_path}: {str(e)}")
 
+class UserCreate(BaseModel):
+    email: str
+    password: str
+
+class User(BaseModel):
+    email: str
+
+def init_auth_db():
+    conn = sqlite3.connect('transcriptions.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            email TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def get_user_by_email(email: str) -> Optional[tuple]:
+    conn = sqlite3.connect('transcriptions.db')
+    c = conn.cursor()
+    c.execute('SELECT email, password_hash FROM users WHERE email = ?', (email,))
+    user = c.fetchone()
+    conn.close()
+    return user
+
+def create_user(email: str, password: str) -> bool:
+    try:
+        # Hash the password
+        salt = bcrypt.gensalt()
+        password_hash = bcrypt.hashpw(password.encode('utf-8'), salt)
+        
+        conn = sqlite3.connect('transcriptions.db')
+        c = conn.cursor()
+        c.execute('INSERT INTO users (email, password_hash) VALUES (?, ?)',
+                 (email, password_hash.decode('utf-8')))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=7)  # Token expires in 7 days
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    logger.error(f"get current user {credentials}")
+    if credentials is None:  # For open paths
+        return None
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        logger.error(f"{payload}")
+        email: str = payload.get("sub")
+        if email is None:
+            raise HTTPException(
+                status_code=307,  # Temporary redirect
+                detail="Not authenticated",
+                headers={"Location": "/login"}
+            )
+        return User(email=email)
+    except (jwt.ExpiredSignatureError, jwt.JWTError):
+        raise HTTPException(
+            status_code=307,  # Temporary redirect
+            detail="Not authenticated",
+            headers={"Location": "/login"}
+        )
+
+@app.get("/login")
+async def login_page(request: Request):
+    return FileResponse("static/login.html")
+
 @app.get("/")
-async def read_root():
-    return FileResponse("static/transcribe.html")
+async def read_root(request: Request, user: User = Depends(get_current_user)):
+    return templates.TemplateResponse(
+        "transcribe.html.jinja2",
+        {
+            "request": request,  # Required by Jinja2Templates
+            "email": user.email
+        }
+    )
+@app.get("/auth.js")
+async def read_auth():
+    return FileResponse("static/auth.js")
 @app.get("/transcribe.js")
-async def read_root():
+async def read_transcribe():
     return FileResponse("static/transcribe.js")
 
 @app.post("/upload")
 async def upload_file(
+        user: User = Depends(get_current_user),
         file: UploadFile = File(...),
         num_speakers: int = Form(...),
         file_name: str = Form(...),
         background_tasks: BackgroundTasks = None):
-    """Handle file upload and start transcription process."""
-    try:
-        # Generate unique job ID
-        job_id = str(uuid.uuid4())
+    # Generate unique job ID
+    job_id = str(uuid.uuid4())
 
-        # Save file
-        file_path = UPLOAD_DIR / f"{job_id}_{file.filename}"
-        logger.info(f"Uploading file: {file_path}")
-        async with aiofiles.open(file_path, 'wb') as out_file:
-            content = await file.read()
-            await out_file.write(content)
+    # Save file
+    file_path = UPLOAD_DIR / f"{job_id}_{file.filename}"
+    logger.info(f"Uploading file: {file_path}")
+    async with aiofiles.open(file_path, 'wb') as out_file:
+        content = await file.read()
+        await out_file.write(content)
 
-        # Create job
-        job = TranscriptionJob(
-            job_id=job_id,
-            filename=file.filename,
-            human_readable_filename=file_name,
-            status="uploaded",
-            progress=0,
-        )
-        active_jobs[job_id] = job
-        save_transcription(job)
+    # Create job
+    job = TranscriptionJob(
+        job_id=job_id,
+        filename=file.filename,
+        human_readable_filename=file_name,
+        status="uploaded",
+        progress=0,
+    )
+    active_jobs[job_id] = job
+    save_transcription(job, user.email)
 
-        # Start processing in background
-        background_tasks.add_task(process_audio, job_id, file_path, num_speakers)
+    # Start processing in background
+    background_tasks.add_task(process_audio, job_id, file_path, num_speakers)
 
-        return {"job_id": job_id}
+    return {"job_id": job_id}
 
-    except Exception as e:
-        logger.error(f"Upload error: {str(e)}")
-        return {"error": str(e)}, 500
 
 
 @app.websocket("/ws/{job_id}")
@@ -265,13 +413,13 @@ async def cleanup_jobs():
 
 
 @app.get("/jobs")
-async def get_all_jobs():
+async def get_all_jobs(user: User = Depends(get_current_user)):
     """Get list of all transcription jobs."""
     conn = create_connection()
     if conn:
         try:
             c = conn.cursor()
-            c.execute('SELECT job_id, human_readable_filename, status, transcript FROM transcription_jobs')
+            c.execute('SELECT job_id, human_readable_filename, status, transcript FROM transcription_jobs WHERE owner = ?', (user.email,))
             jobs = c.fetchall()
             return [{
                 "job_id": job[0],
@@ -283,8 +431,84 @@ async def get_all_jobs():
             conn.close()
 
 
+
+# Add these routes to your FastAPI app
+@app.post("/auth/signup")
+async def signup(user: UserCreate):
+    if len(user.password) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 8 characters long"
+        )
+    
+    if get_user_by_email(user.email):
+        raise HTTPException(
+            status_code=400,
+            detail="Email already registered"
+        )
+    
+    success = create_user(user.email, user.password)
+    if not success:
+        raise HTTPException(
+            status_code=400,
+            detail="Failed to create user"
+        )
+    
+    return {"message": "User created successfully"}
+
+@app.post("/auth/login")
+async def login(user: UserCreate):
+    db_user = get_user_by_email(user.email)
+    if not db_user:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password"
+        )
+
+    stored_password_hash = db_user[1].encode('utf-8')
+    if not bcrypt.checkpw(user.password.encode('utf-8'), stored_password_hash):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password"
+        )
+
+    access_token = create_access_token({"sub": user.email})
+
+    # response = RedirectResponse(url="/", status_code=303)
+    response = JSONResponse(
+        content={"redirect": "/"},
+        status_code=200
+    )
+    response.set_cookie(
+        key="Authorization",
+        value=f"Bearer {access_token}",
+        httponly=True,
+        max_age=1800,  # 30 minutes
+        secure=True,  # For HTTPS
+        samesite="lax"
+    )
+    return response
+
+# Modify your existing endpoints to require authentication
+@app.get("/")
+async def read_root(user: User = Depends(get_current_user)):
+    return FileResponse("static/transcribe.html")
+
+@app.post("/upload")
+async def upload_file(
+        file: UploadFile = File(...),
+        num_speakers: int = Form(...),
+        file_name: str = Form(...),
+        background_tasks: BackgroundTasks = None,
+        user: User = Depends(get_current_user)):
+    # Your existing upload code here
+    pass
+
+
+
 if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 

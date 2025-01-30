@@ -19,3 +19,7 @@ pytest
 pytest-asyncio
 pytest-mock
 webrtcvad
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+jinja2

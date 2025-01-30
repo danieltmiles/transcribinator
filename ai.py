@@ -71,8 +71,14 @@ def clean_overlapping_text(text_list):
     return [text for text in cleaned if text.strip()]
 
 def format_timestamp(seconds):
-    """Convert seconds to HH:MM:SS format"""
-    return str(datetime.fromtimestamp(seconds).strftime('%H:%M:%S'))
+    seconds = int(seconds)
+    one_hour = 60 * 60
+    one_minute = 60
+    hours = int(seconds / one_hour)
+    remaining_seconds = seconds % one_hour
+    minutes = int(remaining_seconds / one_minute)
+    remaining_seconds = remaining_seconds % one_minute
+    return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
 
 async def process_audio(audio_file_path: str, num_speakers: int, min_segment_length: float, progress_send_stream: MemoryObjectSendStream[int], transcript_send_stream: MemoryObjectSendStream[str]):
     """
@@ -94,6 +100,12 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
     if signal.shape[0] > 1:
         signal = torch.mean(signal, dim=0, keepdim=True)
     signal = signal.squeeze()
+
+    # whisper needs a sample rate of 16000
+    if sr != 16000:
+        signal = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)(signal)
+        sr = 16000
+
     start = time.time()
     print("Loading models...")
     device = "cpu"

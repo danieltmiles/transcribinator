@@ -21,34 +21,36 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS transcription_jobs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     job_id TEXT NOT NULL,
+                    owner TEXT NOT NULL,
                     filename TEXT NOT NULL,
                     human_readable_filename TEXT NOT NULL,
                     status TEXT NOT NULL,
-                    transcript TEXT
+                    transcript TEXT,
+                    FOREIGN KEY (owner) REFERENCES users(email)
                 );
             """)
             conn.commit()
         finally:
             conn.close()
 
-def save_transcription(job: TranscriptionJob):
+def save_transcription(job: TranscriptionJob, user_email: str):
     if conn := create_connection():
         try:
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO transcription_jobs (job_id, filename, human_readable_filename, status, transcript)
-                VALUES (?, ?, ?, ?, ?)
-            """, (job.job_id, job.filename, job.human_readable_filename, job.status, job.transcript))
+                INSERT INTO transcription_jobs (job_id, owner, filename, human_readable_filename, status, transcript)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (job.job_id, user_email, job.filename, job.human_readable_filename, job.status, job.transcript))
             conn.commit()
         finally:
             conn.close()
 
-def get_jobs():
+def get_jobs(user_email: str):
     jobs: dict[str, TranscriptionJob] = {}
     if conn := create_connection():
         try:
             cur = conn.cursor()
-            cur.execute("SELECT job_id, filename, human_readable_filename, status FROM transcription_jobs")
+            cur.execute("SELECT job_id, filename, human_readable_filename, status FROM transcription_jobs WHERE owner = ?", user_email)
             for row in cur.fetchall():
                 status = row[3] if row[3] == "completed" else "restarted"
                 job_obj = TranscriptionJob(job_id=row[0], filename=row[1], human_readable_filename=row[2], status=status)
