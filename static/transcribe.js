@@ -45,7 +45,7 @@ document.addEventListener('DOMContentLoaded', () => {
     uploadArea.addEventListener('click', () => {
         const input = document.createElement('input');
         input.type = 'file';
-        input.accept = 'audio/*';
+        input.accept = 'audio/*,video/*';
         input.onchange = e => {
             const file = e.target.files[0];
     	if (file) {
@@ -130,14 +130,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     
     async function handleFile(file) {
-        if (!file.type.startsWith('audio/')) {
-            showError('Please upload an audio file.');
-            return;
+        if (file.type.startsWith('audio/') || file.type.startsWith('video/')) {
+            // Store the file and show dialog
+            currentFile = file;
+            speakerDialog.style.display = 'flex';
+        } else {
+            showError('Please upload an audio or video file.');
         }
-    
-        // Store the file and show dialog
-        currentFile = file;
-        speakerDialog.style.display = 'flex';
     }
     
     
@@ -176,7 +175,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     
     // Handle dialog buttons
-    document.getElementById('confirmUpload').addEventListener('click', () => {
+    document.getElementById('confirmUpload').addEventListener('click', async () => {
         const speakers = parseInt(numSpeakers.value);
         if (speakers < 1 || speakers > 10) {
             alert('Please enter a number between 1 and 10');
@@ -185,11 +184,144 @@ document.addEventListener('DOMContentLoaded', () => {
         const fileName = document.getElementById('fileName').value.trim();
         speakerDialog.style.display = 'none';
         if (currentFile) {
+            if (currentFile.type.startsWith('video/')) {
+              const audioBlob = await extractAudioFromVideo(currentFile);
+              // Create a File object from the blob
+              // Use original filename but change extension to .wav
+              const originalName = currentFile.name.replace(/\.[^/.]+$/, "");
+              const audioFile = new File(
+                [audioBlob], 
+                `${originalName}.mkv`,
+                { type: 'audio/wav' }
+              );
+              currentFile = audioFile;
+            }
             uploadFile(currentFile, speakers, fileName);
             currentFile = null;
         }
     });
-    
+
+
+	/**
+ * Extracts audio from a video file as fast as possible and outputs WAV format
+ * @param {File} videoFile - The video file to extract audio from
+ * @returns {Promise<Blob>} - A promise that resolves with the audio blob in WAV format
+ */
+async function extractAudioFromVideo(videoFile) {
+  console.log('Starting high-speed audio extraction from:', videoFile.name);
+  console.log('Video file size:', (videoFile.size / (1024 * 1024)).toFixed(2), 'MB');
+
+  // Create video element
+  const video = document.createElement('video');
+  video.src = URL.createObjectURL(videoFile);
+
+  console.log('Loading video...');
+  await video.load();
+  const originalDuration = video.duration;
+  console.log('Video loaded. Original duration:', originalDuration, 'seconds');
+
+  // Set maximum playback speed
+  video.playbackRate = 16.0;
+  console.log('Set playback speed to:', video.playbackRate, 'x');
+
+  // Create audio context and connections
+  const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  console.log('Audio context created. Sample rate:', audioContext.sampleRate, 'Hz');
+
+  const source = audioContext.createMediaElementSource(video);
+  const destination = audioContext.createMediaStreamDestination();
+  source.connect(destination);
+  console.log('Audio connections established');
+
+  // Create promise to handle MediaRecorder
+  return new Promise((resolve, reject) => {
+    try {
+      // Try to use WAV encoding if available
+      const options = {
+        mimeType: 'audio/wav'
+      };
+
+      // Fall back to default if WAV not supported
+      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+        console.log('WAV not directly supported, will convert final output');
+        options.mimeType = 'audio/webm;codecs=pcm';
+      }
+
+      const mediaRecorder = new MediaRecorder(destination.stream, options);
+      console.log('MediaRecorder created with MIME type:', mediaRecorder.mimeType);
+
+      const startTime = Date.now();
+      const chunks = [];
+
+      mediaRecorder.ondataavailable = (e) => {
+        chunks.push(e.data);
+        const chunkSizeMB = (e.data.size / (1024 * 1024)).toFixed(2);
+        console.log(`Chunk received: ${chunkSizeMB} MB`);
+      };
+
+      // Log progress every 500ms
+      let lastTime = 0;
+      const progressInterval = setInterval(() => {
+        const currentTime = video.currentTime;
+        const progress = (currentTime / originalDuration * 100).toFixed(1);
+        const timeElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        const extractionSpeed = (currentTime - lastTime) * 2;
+        lastTime = currentTime;
+
+        console.log(`Progress: ${progress}% (${timeElapsed}s elapsed, processing at ${extractionSpeed.toFixed(1)}x speed)`);
+      }, 500);
+
+      mediaRecorder.onstop = async () => {
+        clearInterval(progressInterval);
+
+        // Always create final blob as WAV
+        const blob = new Blob(chunks, { type: 'audio/wav' });
+        const totalTime = (Date.now() - startTime) / 1000;
+        const speedFactor = originalDuration / totalTime;
+
+        console.log('Audio extraction complete!');
+        console.log(`Original duration: ${originalDuration.toFixed(1)}s`);
+        console.log(`Processing time: ${totalTime.toFixed(1)}s`);
+        console.log(`Average speed: ${speedFactor.toFixed(1)}x`);
+        console.log('Final audio size:', (blob.size / (1024 * 1024)).toFixed(2), 'MB');
+        console.log('Final audio format:', blob.type);
+
+        URL.revokeObjectURL(video.src);
+        audioContext.close();
+        resolve(blob);
+      };
+
+      // Start recording and playing
+      video.muted = true;
+      mediaRecorder.start(500);
+      console.log('Starting high-speed playback and recording...');
+      video.play();
+
+      // Stop when video ends
+      video.onended = () => {
+        console.log('Video playback complete, stopping recorder...');
+        mediaRecorder.stop();
+      };
+
+      // Handle errors
+      video.onerror = () => {
+        clearInterval(progressInterval);
+        console.error('Video loading failed:', video.error);
+        reject(new Error('Video loading failed'));
+      };
+
+      mediaRecorder.onerror = () => {
+        clearInterval(progressInterval);
+        console.error('Recording failed:', mediaRecorder.error);
+        reject(new Error('Audio recording failed'));
+      };
+
+    } catch (error) {
+      console.error('Extraction error:', error);
+      reject(error);
+    }
+  });
+}
     
     function connectWebSocket(jobId, repeat_count = 0) {
         // // Close existing connection if any
@@ -200,6 +332,7 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
     
+	let complete = false;
         websocket = new WebSocket(`wss://transcribe.doodledome.org/ws/${jobId}`);
     
         websocket.onmessage = function(event) {
@@ -212,7 +345,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     break;
     
                 case 'transcript':
-                    showTranscript(data.text);
+                    showTranscript(data.text, jobId);
+                    complete = true;
                     websocket.close();
                     break;
     
@@ -224,15 +358,19 @@ document.addEventListener('DOMContentLoaded', () => {
         };
     
         websocket.onerror = function(error) {
-            showError('WebSocket error occurred', error);
-            websocket.close();
-            connectWebSocket(jobId, repeat_count + 1);
+            if(!complete) {
+                showError('WebSocket error occurred', error);
+                websocket.close();
+                connectWebSocket(jobId, repeat_count + 1);
+            }
         };
     
         websocket.onclose = function() {
-            websocket = null;
-            showError('WebSocket connection closed unexpectedly');
-    	connectWebSocket(jobId, repeat_count + 1);
+            if(!complete) {
+                websocket = null;
+                showError('WebSocket connection closed unexpectedly');
+    	        connectWebSocket(jobId, repeat_count + 1);
+            }
         };
     }
     
@@ -252,10 +390,11 @@ document.addEventListener('DOMContentLoaded', () => {
         resetUploadArea();
     }
     
-    function showTranscript(text) {
+    function showTranscript(text, job_id) {
         transcriptText.textContent = text;
         transcriptContainer.style.display = 'block';
         progressContainer.style.display = 'none';
+        document.getElementById('transcriptTextJobID').setAttribute('data-job-id', job_id);
     }
 
 
@@ -333,14 +472,6 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
     
-    // Modify your showTranscript function to store the job ID and show the rename button
-    function showTranscript(text, jobId) {
-        transcriptText.textContent = text;
-        transcriptContainer.style.display = 'block';
-        progressContainer.style.display = 'none';
-        renameSpeakersButton.style.display = 'inline-block';
-    }
-    
     // Add these event listeners
     renameSpeakersButton.addEventListener('click', async () => {
         let currentJobId = document.getElementById('transcriptTextJobID').dataset.jobId;
@@ -366,27 +497,6 @@ document.addEventListener('DOMContentLoaded', () => {
     
     confirmRename.addEventListener('click', submitSpeakerNames);
     
-    //// Modify your WebSocket message handler to include the job ID when showing the transcript
-    //websocket.onmessage = function(event) {
-    //    const data = JSON.parse(event.data);
-    //
-    //    switch(data.type) {
-    //        case 'progress':
-    //            updateProgress(data.progress);
-    //            updateStage(data.stage);
-    //            break;
-    //
-    //        case 'transcript':
-    //            showTranscript(data.text, data.job_id); // Pass the job ID
-    //            websocket.close();
-    //            break;
-    //
-    //        case 'error':
-    //            showError(data.message);
-    //            websocket.close();
-    //            break;
-    //    }
-    //};
     loadPreviousTranscripts();
 });
 

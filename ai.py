@@ -6,7 +6,6 @@ from io import StringIO
 import torch
 import tqdm
 import torchaudio
-from anyio import WouldBlock
 from anyio.streams.memory import MemoryObjectSendStream
 from speechbrain.pretrained import SpeakerRecognition
 from pydub import AudioSegment
@@ -18,6 +17,20 @@ except AttributeError:
         "Please install the correct Whisper package using: pip install openai-whisper\n"
         "If you have the 'whisper' package installed, first uninstall it with: pip uninstall whisper"
     )
+class ModelHaver(object):
+    _instance = None
+
+    def __init__(self):
+        raise RuntimeError('Call instance() instead')
+
+    @classmethod
+    def instance(cls):
+        if cls._instance is None:
+            cls._instance = cls.__new__(cls)
+            cls._instance.whisper_model = whisper.load_model("large")
+            # Put any initialization here.
+        return cls._instance
+
 import numpy as np
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -120,7 +133,7 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
     )
     
     try:
-        whisper_model = whisper.load_model("large")
+        whisper_model = ModelHaver.instance().whisper_model
     except AttributeError:
         raise ImportError(
             "Error loading Whisper model. Please ensure you have openai-whisper installed, not whisper"

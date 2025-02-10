@@ -23,3 +23,5 @@ python-jose[cryptography]
 passlib[bcrypt]
 python-multipart
 jinja2
+protobuf
+bitsandbytes
