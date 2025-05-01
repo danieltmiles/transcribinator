@@ -25,3 +25,4 @@ python-multipart
 jinja2
 protobuf
 bitsandbytes
+jupyter

@@ -9,6 +9,13 @@ import torchaudio
 from anyio.streams.memory import MemoryObjectSendStream
 from speechbrain.pretrained import SpeakerRecognition
 from pydub import AudioSegment
+from transformers import Qwen2ForCausalLM, Qwen2TokenizerFast, AutoModelForCausalLM, AutoTokenizer
+
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+if torch.mps.is_available():
+    device = "mps"
 
 try:
     import whisper
@@ -32,7 +39,6 @@ class ModelHaver(object):
         return cls._instance
 
 import numpy as np
-from datetime import datetime
 from difflib import SequenceMatcher
 import warnings
 
@@ -121,11 +127,6 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
 
     start = time.time()
     print("Loading models...")
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    if torch.mps.is_available():
-        device = "mps"
     speaker_recognition = SpeakerRecognition.from_hparams(
         source="speechbrain/spkrec-ecapa-voxceleb",
         savedir="pretrained_models/spkrec-ecapa-voxceleb",
@@ -258,7 +259,7 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
             current_start = segment['start']
         else:
             current_texts.append(segment['text'])
-    
+
     # Add final segment
     if current_texts:
         cleaned_texts = clean_overlapping_text(current_texts)
@@ -267,8 +268,35 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
                 'speaker': current_speaker,
                 'start': format_timestamp(current_start),
                 'end': format_timestamp(raw_segments[-1]['end']),
-                'text': ' '.join(cleaned_texts)
+                'text': " ".join(cleaned_texts)
             })
+
+    del whisper_model
+    del ModelHaver._instance
+    ModelHaver._instance = None
+    model_name = "Qwen/Qwen2.5-7B-Instruct"
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,  # Force FP16
+        # device_map="cuda:0",  # Explicitly map to GPU if you have one
+        device_map="auto",
+        trust_remote_code=True,
+        max_memory={0: "22GiB"},  # Reserve a bit less than total VRAM
+        # low_cpu_mem_usage=True,
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=True
+    )
+    for i, segment in enumerate(transcript):
+        current_progress = int((i / len(transcript)) * 100)
+        await progress_send_stream.send(current_progress)
+        await asyncio.sleep(0.1)
+        print(f"\ntext:\n{segment['text']}\n")
+        cleaned_segment_text = llm_clean(segment["text"], model, tokenizer)
+        print(f"\ncleaned text:\n{cleaned_segment_text}\n")
+        transcript[i]["text"] = cleaned_segment_text
     
     # Clean up temp directory
     # os.rmdir(temp_dir)
@@ -276,7 +304,8 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
     await progress_send_stream.send(100)
     await transcript_send_stream.send(produce_transcript(transcript))
     LOGGER.info(f"{transcript}")
-
+    del model
+    model = None
     return transcript
 
 def save_transcript(transcript, output_file):
@@ -308,3 +337,61 @@ if __name__ == "__main__":
     )
     save_transcript(transcript, output_file)
     print(f"Transcript saved to {output_file}")
+
+def generate_from_prompt(prompt: str, model: Qwen2ForCausalLM, tokenizer: Qwen2TokenizerFast) -> str:
+    test_encoding = tokenizer(prompt, return_tensors="pt")
+    prompt_length = test_encoding.input_ids.size(1)
+    max_length = min(prompt_length + 200, 32000)
+    encoded = tokenizer(
+        prompt,
+        return_tensors="pt",
+        padding=False,
+        truncation=True,
+        max_length=max_length,
+    )
+    attention_mask = encoded['attention_mask'].to(device)
+    outputs = model.generate(
+        encoded.input_ids.to(device),
+        attention_mask=attention_mask,
+        max_new_tokens=prompt_length,  # Allow some buffer for expanded text
+        temperature=0.2,  # Lower temperature for more consistent outputs
+        do_sample=True,
+        top_p=0.9,
+        repetition_penalty=1.2
+    )
+    return tokenizer.decode(outputs[0], skip_special_tokens=False)
+
+def llm_clean(text: str, model: Qwen2ForCausalLM, tokenizer: Qwen2TokenizerFast) -> str | None:
+    prompt_template = """You are a transcript editor. The following text was transcribed from an audio recording by an unskilled person who
+made errors grouping the words into sentences and sometimes typed a word or phrase multiple times, when the speaker did not say it.
+Please identify and correct these transcriber errors without altering the speakers' original language. Follow these rules then mark
+the end of the cleaned up text with "END OUTPUT TEXT"
+
+Rules:
+1. Remove only the most obvious speech disfluencies like "uh", "um", "er". Keep redundancies if they seem intentional.
+2. Correct homophones (two, too, to) but maintain the original spelling if it appears to be a typo or error.
+3. Maintain the exact wording of the speaker, including errors and run-on sentences. Create an incorrect sentence if necessary to preserve the speaker's intended meaning.
+4. Preserve repetitions that appear to be intentional, even if they could be considered redundant or awkward.
+5. Avoid rephrasing, condensing, or adding nuance to the content even when the speaker's intended message is unclear.
+6. Preserve the exact wording used by the speaker, even if it creates ambiguity or awkwardness.
+7. Capitalize proper nouns correctly, but leave other capitalization inconsistencies intact.
+
+BEGIN INPUT TEXT:
+{text}
+END INPUT TEXT
+
+BEGIN OUTPUT TEXT:
+"""
+    text = text.replace("...", "")
+    prompt = prompt_template.format(text=text)
+    full_output = ""
+    end_delimiter = "END OUTPUT TEXT"
+    while end_delimiter not in full_output[len(prompt):]:
+        full_output = generate_from_prompt(prompt, model, tokenizer)
+        begin_delim = "BEGIN OUTPUT TEXT:"
+        begin_indexes = [i for i in range(len(full_output)) if full_output.startswith(begin_delim, i)]
+        end_delim = "END OUTPUT TEXT"
+        end_indexes = [i for i in range(len(full_output)) if full_output.startswith(end_delim, i)]
+        if len(end_indexes) > 1:
+            chunk = full_output[begin_indexes[-1] + len(begin_delim):end_indexes[1]]
+            return chunk.strip()
