@@ -26,3 +26,4 @@ jinja2
 protobuf
 bitsandbytes
 jupyter
+ctransformers

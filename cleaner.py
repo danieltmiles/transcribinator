@@ -1,10 +1,11 @@
 import re
 from typing import List, Tuple
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from ctransformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
 
 MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8"
+# MODEL_NAME = "Qwen/Qwen3-8B"
 # MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct-GPTQ-Int8"
 # MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 # MODEL_NAME = "Qwen/Qwen1.5-4B-Chat"
@@ -21,9 +22,9 @@ class LLMTranscriptCleaner:
         """
         self.device = device
         # Initialize the model and tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained(
-                model_name, trust_remote_code=True, low_cpu_mem_usage=low_cpu_mem_usage).to(device)
+                model_name, low_cpu_mem_usage=low_cpu_mem_usage).to(device)
         
         # Basic cleanup patterns for pre-processing
         self.basic_patterns = [
@@ -53,7 +54,7 @@ Original text: {text}
 
 Cleaned text: """
 
-    def _process_with_llm(self, text: str, prompt_template) -> str:
+    def _process_with_llm(self, text: str) -> str:
         """Process the text using the LLM."""
         prompt = self._create_prompt(text)
         
