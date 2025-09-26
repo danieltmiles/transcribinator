@@ -95,6 +95,7 @@ document.addEventListener('DOMContentLoaded', () => {
         errorMessage.style.display = 'none';
         transcriptContainer.style.display = 'none';
         progressContainer.style.display = 'block';
+        uploadArea.style.display = 'none';
         resetProgressBars();
     
         try {
@@ -177,8 +178,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     fileItem.addEventListener('click', () => {
                         document.getElementById('transcriptText').textContent = job.transcript;
                         document.getElementById('transcriptContainer').style.display = 'block';
-    		        document.getElementById('transcriptContainer').scrollIntoView({ behavior: 'smooth' });
-			document.getElementById('transcriptTextJobID').setAttribute('data-job-id', job.job_id);
+                        document.getElementById('progressContainer').style.display = 'none';
+                        uploadArea.style.display = 'none';
+			        document.getElementById('transcriptContainer').scrollIntoView({ behavior: 'smooth' });
+				document.getElementById('transcriptTextJobID').setAttribute('data-job-id', job.job_id);
                     });
                 }
     
@@ -431,6 +434,7 @@ async function extractAudioFromVideo(videoFile) {
         errorMessage.textContent = message;
         errorMessage.style.display = 'block';
         progressContainer.style.display = 'none';
+        uploadArea.style.display = 'block';
         resetUploadArea();
     }
     
@@ -438,6 +442,7 @@ async function extractAudioFromVideo(videoFile) {
         transcriptText.textContent = text;
         transcriptContainer.style.display = 'block';
         progressContainer.style.display = 'none';
+        uploadArea.style.display = 'none';
         document.getElementById('transcriptTextJobID').setAttribute('data-job-id', job_id);
     }
 
