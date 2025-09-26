@@ -101,7 +101,7 @@ def format_timestamp(seconds):
 
 async def process_audio(audio_file_path: str, num_speakers: int, min_segment_length: float, progress_send_stream: MemoryObjectSendStream[dict], transcript_send_stream: MemoryObjectSendStream[str]):
     """
-    Process audio file for speaker diarization and transcription
+    Process audio file for speaker identification and transcription
 
     Parameters:
     - audio_file_path: Path to the audio file

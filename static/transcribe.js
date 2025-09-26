@@ -6,6 +6,7 @@ let stageTextEl,
     progressBarDiarization, progressTextDiarization,
     progressBarTranscription, progressTextTranscription,
     progressBarCleanup, progressTextCleanup;
+let newTranscriptionButton, newTranscriptionWrapper;
 
 document.addEventListener('DOMContentLoaded', () => {
     const uploadArea = document.getElementById('uploadArea');
@@ -29,8 +30,17 @@ document.addEventListener('DOMContentLoaded', () => {
     const progressTextTranscription = document.getElementById('progressTextTranscription');
     const progressBarCleanup = document.getElementById('progressBarCleanup');
     const progressTextCleanup = document.getElementById('progressTextCleanup');
+
+    const newTranscriptionButton = document.getElementById('newTranscriptionButton');
+    const newTranscriptionWrapper = document.getElementById('newTranscriptionWrapper');
+    if (newTranscriptionButton) {
+        newTranscriptionButton.addEventListener('click', () => {
+            window.location.reload();
+        });
+    }
     
-    const API_URL = 'https://transcribe.doodledome.org';  // Replace with your API URL
+    // Determine API base dynamically from current location; allow override via window.API_BASE
+    const API_BASE = window.API_BASE || window.location.origin;
     
     // Drag and drop handlers
     ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
@@ -96,6 +106,7 @@ document.addEventListener('DOMContentLoaded', () => {
         transcriptContainer.style.display = 'none';
         progressContainer.style.display = 'block';
         uploadArea.style.display = 'none';
+        if (newTranscriptionWrapper) newTranscriptionWrapper.style.display = 'block';
         resetProgressBars();
     
         try {
@@ -104,7 +115,7 @@ document.addEventListener('DOMContentLoaded', () => {
             formData.append('num_speakers', numSpeakers);
             formData.append('file_name', fileName);
     
-            const response = await fetch('https://transcribe.doodledome.org/upload', {
+            const response = await fetch(`${API_BASE}/upload`, {
                 method: 'POST',
                 body: formData
             });
@@ -180,7 +191,8 @@ document.addEventListener('DOMContentLoaded', () => {
                         document.getElementById('transcriptContainer').style.display = 'block';
                         document.getElementById('progressContainer').style.display = 'none';
                         uploadArea.style.display = 'none';
-			        document.getElementById('transcriptContainer').scrollIntoView({ behavior: 'smooth' });
+                        if (newTranscriptionWrapper) newTranscriptionWrapper.style.display = 'block';
+		        document.getElementById('transcriptContainer').scrollIntoView({ behavior: 'smooth' });
 				document.getElementById('transcriptTextJobID').setAttribute('data-job-id', job.job_id);
                     });
                 }
@@ -351,7 +363,9 @@ async function extractAudioFromVideo(videoFile) {
         }
     
 	let complete = false;
-        websocket = new WebSocket(`wss://transcribe.doodledome.org/ws/${jobId}`);
+        const wsScheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        const wsUrl = `${wsScheme}://${window.location.host}/ws/${jobId}`;
+        websocket = new WebSocket(wsUrl);
     
         websocket.onmessage = function(event) {
             const data = JSON.parse(event.data);
@@ -435,6 +449,7 @@ async function extractAudioFromVideo(videoFile) {
         errorMessage.style.display = 'block';
         progressContainer.style.display = 'none';
         uploadArea.style.display = 'block';
+        if (newTranscriptionWrapper) newTranscriptionWrapper.style.display = 'none';
         resetUploadArea();
     }
     
@@ -443,13 +458,14 @@ async function extractAudioFromVideo(videoFile) {
         transcriptContainer.style.display = 'block';
         progressContainer.style.display = 'none';
         uploadArea.style.display = 'none';
+        if (newTranscriptionWrapper) newTranscriptionWrapper.style.display = 'block';
         document.getElementById('transcriptTextJobID').setAttribute('data-job-id', job_id);
     }
 
 
     async function fetchSpeakers(jobId) {
         try {
-            const response = await fetch(`${API_URL}/jobs/${jobId}/speakers`);
+            const response = await fetch(`${API_BASE}/jobs/${jobId}/speakers`);
             if (!response.ok) {
                 throw new Error('Failed to fetch speakers');
             }
@@ -493,7 +509,7 @@ async function extractAudioFromVideo(videoFile) {
         try {
             confirmRename.classList.add('loading');
             let currentJobId = document.getElementById('transcriptTextJobID').dataset.jobId;
-            const response = await fetch(`${API_URL}/jobs/${currentJobId}/speakers`, {
+            const response = await fetch(`${API_BASE}/jobs/${currentJobId}/speakers`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',

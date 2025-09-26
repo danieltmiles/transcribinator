@@ -505,7 +505,7 @@ async def signup(user: UserCreate):
     return {"message": "User created successfully"}
 
 @app.post("/auth/login")
-async def login(user: UserCreate):
+async def login(user: UserCreate, request: Request):
     db_user = get_user_by_email(user.email)
     if not db_user:
         raise HTTPException(
@@ -527,12 +527,16 @@ async def login(user: UserCreate):
         content={"redirect": "/"},
         status_code=200
     )
+    # Determine scheme, honoring reverse proxy headers
+    forwarded_proto = (request.headers.get('x-forwarded-proto') or request.headers.get('X-Forwarded-Proto') or '').split(',')[0].strip()
+    scheme = forwarded_proto or request.url.scheme
+    is_secure = scheme == 'https'
     response.set_cookie(
         key="Authorization",
         value=f"Bearer {access_token}",
         httponly=True,
         max_age=1800,  # 30 minutes
-        secure=True,  # For HTTPS
+        secure=is_secure,  # Only set Secure on HTTPS
         samesite="lax"
     )
     return response
