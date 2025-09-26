@@ -217,15 +217,33 @@
 
         <div class="progress-container" id="progressContainer">
             <p class="stage-text" id="stageText">Initializing...</p>
-            <p>Processing... <span id="progressText">0%</span></p>
-            <div class="progress-bar">
-                <div class="progress" id="progressBar"></div>
+            <div class="progress-group">
+                <p>Diarization (Speaker Identification): <span id="progressTextDiarization">0%</span></p>
+                <div class="progress-bar">
+                    <div class="progress" id="progressBarDiarization"></div>
+                </div>
+            </div>
+            <div class="progress-group">
+                <p>Transcription: <span id="progressTextTranscription">0%</span></p>
+                <div class="progress-bar">
+                    <div class="progress" id="progressBarTranscription"></div>
+                </div>
+            </div>
+            <div class="progress-group">
+                <p>Cleanup (LLM): <span id="progressTextCleanup">0%</span></p>
+                <div class="progress-bar">
+                    <div class="progress" id="progressBarCleanup"></div>
+                </div>
             </div>
         </div>
 
         <div class="dialog-overlay" id="speakerDialog">
             <div class="dialog">
                 <h2>File Details</h2>
+                <div class="input-group" id="selectedFilesDisplay" style="margin-bottom: 1rem;">
+                    <label>File to upload:</label>
+                    <div id="selectedFileName" style="font-weight: 600; word-break: break-all;">None selected</div>
+                </div>
                 <div class="input-group">
                     <label for="fileName">File Name:</label>
                     <input type="text" id="fileName" placeholder="Enter a name for this file">

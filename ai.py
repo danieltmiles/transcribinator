@@ -99,7 +99,7 @@ def format_timestamp(seconds):
     remaining_seconds = remaining_seconds % one_minute
     return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
 
-async def process_audio(audio_file_path: str, num_speakers: int, min_segment_length: float, progress_send_stream: MemoryObjectSendStream[int], transcript_send_stream: MemoryObjectSendStream[str]):
+async def process_audio(audio_file_path: str, num_speakers: int, min_segment_length: float, progress_send_stream: MemoryObjectSendStream[dict], transcript_send_stream: MemoryObjectSendStream[str]):
     """
     Process audio file for speaker diarization and transcription
 
@@ -151,11 +151,20 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
     embeddings = []
     
     print(f"Processing audio segments from 0 through {len(signal)} with stride {stride}")
-    for start in tqdm.tqdm(range(0, len(signal), stride), total=len(signal)//stride):
+    await progress_send_stream.send({"stage": "diarization", "progress": 0})
+    diar_last_progress = 0
+    diar_total_iters = max(1, len(range(0, len(signal), stride)))
+    for idx, start in enumerate(tqdm.tqdm(range(0, len(signal), stride), total=diar_total_iters)):
         end = min(start + window_size, len(signal))
         segment = signal[start:end]
         
         if len(segment) < sr * min_segment_length:
+            # Still update progress based on iteration index
+            current_progress = int((idx / diar_total_iters) * 100)
+            if current_progress > diar_last_progress:
+                await progress_send_stream.send({"stage": "diarization", "progress": current_progress})
+                await asyncio.sleep(0.05)
+                diar_last_progress = current_progress
             continue
             
         embedding = speaker_recognition.encode_batch(segment.unsqueeze(0))
@@ -166,6 +175,12 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
             'end': end / sr,
             'audio': segment
         })
+        current_progress = int((idx / diar_total_iters) * 100)
+        if current_progress > diar_last_progress:
+            await progress_send_stream.send({"stage": "diarization", "progress": current_progress})
+            await asyncio.sleep(0.05)
+            diar_last_progress = current_progress
+    await progress_send_stream.send({"stage": "diarization", "progress": 100})
     await asyncio.sleep(0.1)
     
     print(f"Clustering speakers (target: {num_speakers} speakers)...")
@@ -181,13 +196,14 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
     # os.makedirs(temp_dir, exist_ok=True)
     
     print(f"Transcribing {len(segments)} segments...")
+    await progress_send_stream.send({"stage": "transcription", "progress": 0})
     last_progress = 0
     await asyncio.sleep(0.1)
     results = []
     for i, segment in tqdm.tqdm(enumerate(segments), total=len(segments)):
         current_progress = int((i / len(segments)) * 100)
         if current_progress > last_progress:
-            await progress_send_stream.send(current_progress)
+            await progress_send_stream.send({"stage": "transcription", "progress": current_progress})
             await asyncio.sleep(0.1)
             last_progress = current_progress
         speaker = f"Speaker_{labels[i]}"
@@ -289,9 +305,12 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
         model_name,
         trust_remote_code=True
     )
+    await progress_send_stream.send({"stage": "transcription", "progress": 100})
+
+    await progress_send_stream.send({"stage": "cleanup", "progress": 0})
     for i, segment in enumerate(transcript):
-        current_progress = int((i / len(transcript)) * 100)
-        await progress_send_stream.send(current_progress)
+        current_progress = int((i / max(1, len(transcript))) * 100)
+        await progress_send_stream.send({"stage": "cleanup", "progress": current_progress})
         await asyncio.sleep(0.1)
         print(f"\ntext:\n{segment['text']}\n")
         cleaned_segment_text = llm_clean(segment["text"], model, tokenizer)
@@ -301,7 +320,7 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
     # Clean up temp directory
     # os.rmdir(temp_dir)
 
-    await progress_send_stream.send(100)
+    await progress_send_stream.send({"stage": "cleanup", "progress": 100})
     await transcript_send_stream.send(produce_transcript(transcript))
     LOGGER.info(f"{transcript}")
     del model

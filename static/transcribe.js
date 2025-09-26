@@ -1,13 +1,15 @@
 // Declare variables at the top level so they're accessible everywhere
-let uploadArea, progressContainer, progressBar, progressText, errorMessage,
+let uploadArea, progressContainer, errorMessage,
     transcriptContainer, transcriptText, copyButton, fileNameDisplay;
 let speakerRenameDialog, speakerInputs, cancelRename, confirmRename, renameSpeakersButton;
+let stageTextEl,
+    progressBarDiarization, progressTextDiarization,
+    progressBarTranscription, progressTextTranscription,
+    progressBarCleanup, progressTextCleanup;
 
 document.addEventListener('DOMContentLoaded', () => {
     const uploadArea = document.getElementById('uploadArea');
     const progressContainer = document.getElementById('progressContainer');
-    const progressBar = document.getElementById('progressBar');
-    const progressText = document.getElementById('progressText');
     const errorMessage = document.getElementById('errorMessage');
     const transcriptContainer = document.getElementById('transcriptContainer');
     const transcriptText = document.getElementById('transcriptText');
@@ -19,6 +21,14 @@ document.addEventListener('DOMContentLoaded', () => {
     const cancelRename = document.getElementById('cancelRename');
     const confirmRename = document.getElementById('confirmRename');
     const renameSpeakersButton = document.getElementById('renameSpeakersButton');
+
+    const stageTextEl = document.getElementById('stageText');
+    const progressBarDiarization = document.getElementById('progressBarDiarization');
+    const progressTextDiarization = document.getElementById('progressTextDiarization');
+    const progressBarTranscription = document.getElementById('progressBarTranscription');
+    const progressTextTranscription = document.getElementById('progressTextTranscription');
+    const progressBarCleanup = document.getElementById('progressBarCleanup');
+    const progressTextCleanup = document.getElementById('progressTextCleanup');
     
     const API_URL = 'https://transcribe.doodledome.org';  // Replace with your API URL
     
@@ -76,6 +86,8 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('cancelUpload').addEventListener('click', () => {
         speakerDialog.style.display = 'none';
         currentFile = null;
+        const selectedFileNameEl = document.getElementById('selectedFileName');
+        if (selectedFileNameEl) selectedFileNameEl.textContent = 'None selected';
     });
 
     async function uploadFile(file, numSpeakers, fileName) {
@@ -83,6 +95,7 @@ document.addEventListener('DOMContentLoaded', () => {
         errorMessage.style.display = 'none';
         transcriptContainer.style.display = 'none';
         progressContainer.style.display = 'block';
+        resetProgressBars();
     
         try {
             const formData = new FormData();
@@ -115,7 +128,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function handleDrop(e) {
         const file = e.dataTransfer.files[0];
         if (file) {
-    	uploadArea.querySelectorAll('p').forEach(p => p.style.display = 'none');
+            uploadArea.querySelectorAll('p').forEach(p => p.style.display = 'none');
             fileNameDisplay.textContent = file.name;
             fileNameDisplay.style.display = 'block';
         }
@@ -133,6 +146,8 @@ document.addEventListener('DOMContentLoaded', () => {
         if (file.type.startsWith('audio/') || file.type.startsWith('video/')) {
             // Store the file and show dialog
             currentFile = file;
+            const selectedFileNameEl = document.getElementById('selectedFileName');
+            if (selectedFileNameEl) selectedFileNameEl.textContent = file.name;
             speakerDialog.style.display = 'flex';
         } else {
             showError('Please upload an audio or video file.');
@@ -340,8 +355,12 @@ async function extractAudioFromVideo(videoFile) {
     
             switch(data.type) {
                 case 'progress':
-                    updateProgress(data.progress);
-                    updateStage(data.stage);
+                    if (['diarization','transcription','cleanup'].includes(data.stage)) {
+                        updateStageProgress(data.stage, data.progress);
+                        updateStageLabel(data.stage);
+                    } else {
+                        updateStageLabel(data.stage);
+                    }
                     break;
     
                 case 'transcript':
@@ -374,13 +393,38 @@ async function extractAudioFromVideo(videoFile) {
         };
     }
     
-    function updateStage(stage) {
-        document.getElementById('stageText').textContent = stage;
+    function updateStageLabel(stage) {
+        if (stageTextEl) {
+            const labels = {
+                diarization: 'Identifying Speakers...',
+                transcription: 'Transcribing Audio...',
+                cleanup: 'Cleaning Up Transcript...'
+            };
+            stageTextEl.textContent = labels[stage] || (stage || 'Initializing...');
+        }
     }
-    
-    function updateProgress(percent) {
-        progressBar.style.width = `${percent}%`;
-        progressText.textContent = `${percent}%`;
+
+    function updateStageProgress(stage, percent) {
+        let barEl, textEl;
+        if (stage === 'diarization') {
+            barEl = progressBarDiarization; textEl = progressTextDiarization;
+        } else if (stage === 'transcription') {
+            barEl = progressBarTranscription; textEl = progressTextTranscription;
+        } else if (stage === 'cleanup') {
+            barEl = progressBarCleanup; textEl = progressTextCleanup;
+        }
+        if (barEl && textEl) {
+            const pct = Math.max(0, Math.min(100, parseInt(percent, 10) || 0));
+            barEl.style.width = `${pct}%`;
+            textEl.textContent = `${pct}%`;
+        }
+    }
+
+    function resetProgressBars() {
+        updateStageLabel('Initializing...');
+        updateStageProgress('diarization', 0);
+        updateStageProgress('transcription', 0);
+        updateStageProgress('cleanup', 0);
     }
     
     function showError(message) {
