@@ -1,13 +1,16 @@
 // Declare variables at the top level so they're accessible everywhere
-let uploadArea, progressContainer, progressBar, progressText, errorMessage,
+let uploadArea, progressContainer, errorMessage,
     transcriptContainer, transcriptText, copyButton, fileNameDisplay;
 let speakerRenameDialog, speakerInputs, cancelRename, confirmRename, renameSpeakersButton;
+let stageTextEl,
+    progressBarDiarization, progressTextDiarization,
+    progressBarTranscription, progressTextTranscription,
+    progressBarCleanup, progressTextCleanup;
+let newTranscriptionButton, newTranscriptionWrapper;
 
 document.addEventListener('DOMContentLoaded', () => {
     const uploadArea = document.getElementById('uploadArea');
     const progressContainer = document.getElementById('progressContainer');
-    const progressBar = document.getElementById('progressBar');
-    const progressText = document.getElementById('progressText');
     const errorMessage = document.getElementById('errorMessage');
     const transcriptContainer = document.getElementById('transcriptContainer');
     const transcriptText = document.getElementById('transcriptText');
@@ -19,8 +22,25 @@ document.addEventListener('DOMContentLoaded', () => {
     const cancelRename = document.getElementById('cancelRename');
     const confirmRename = document.getElementById('confirmRename');
     const renameSpeakersButton = document.getElementById('renameSpeakersButton');
+
+    const stageTextEl = document.getElementById('stageText');
+    const progressBarDiarization = document.getElementById('progressBarDiarization');
+    const progressTextDiarization = document.getElementById('progressTextDiarization');
+    const progressBarTranscription = document.getElementById('progressBarTranscription');
+    const progressTextTranscription = document.getElementById('progressTextTranscription');
+    const progressBarCleanup = document.getElementById('progressBarCleanup');
+    const progressTextCleanup = document.getElementById('progressTextCleanup');
+
+    const newTranscriptionButton = document.getElementById('newTranscriptionButton');
+    const newTranscriptionWrapper = document.getElementById('newTranscriptionWrapper');
+    if (newTranscriptionButton) {
+        newTranscriptionButton.addEventListener('click', () => {
+            window.location.reload();
+        });
+    }
     
-    const API_URL = 'https://transcribe.doodledome.org';  // Replace with your API URL
+    // Determine API base dynamically from current location; allow override via window.API_BASE
+    const API_BASE = window.API_BASE || window.location.origin;
     
     // Drag and drop handlers
     ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
@@ -76,6 +96,8 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('cancelUpload').addEventListener('click', () => {
         speakerDialog.style.display = 'none';
         currentFile = null;
+        const selectedFileNameEl = document.getElementById('selectedFileName');
+        if (selectedFileNameEl) selectedFileNameEl.textContent = 'None selected';
     });
 
     async function uploadFile(file, numSpeakers, fileName) {
@@ -83,6 +105,9 @@ document.addEventListener('DOMContentLoaded', () => {
         errorMessage.style.display = 'none';
         transcriptContainer.style.display = 'none';
         progressContainer.style.display = 'block';
+        uploadArea.style.display = 'none';
+        if (newTranscriptionWrapper) newTranscriptionWrapper.style.display = 'block';
+        resetProgressBars();
     
         try {
             const formData = new FormData();
@@ -90,7 +115,7 @@ document.addEventListener('DOMContentLoaded', () => {
             formData.append('num_speakers', numSpeakers);
             formData.append('file_name', fileName);
     
-            const response = await fetch('https://transcribe.doodledome.org/upload', {
+            const response = await fetch(`${API_BASE}/upload`, {
                 method: 'POST',
                 body: formData
             });
@@ -115,7 +140,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function handleDrop(e) {
         const file = e.dataTransfer.files[0];
         if (file) {
-    	uploadArea.querySelectorAll('p').forEach(p => p.style.display = 'none');
+            uploadArea.querySelectorAll('p').forEach(p => p.style.display = 'none');
             fileNameDisplay.textContent = file.name;
             fileNameDisplay.style.display = 'block';
         }
@@ -133,6 +158,8 @@ document.addEventListener('DOMContentLoaded', () => {
         if (file.type.startsWith('audio/') || file.type.startsWith('video/')) {
             // Store the file and show dialog
             currentFile = file;
+            const selectedFileNameEl = document.getElementById('selectedFileName');
+            if (selectedFileNameEl) selectedFileNameEl.textContent = file.name;
             speakerDialog.style.display = 'flex';
         } else {
             showError('Please upload an audio or video file.');
@@ -162,8 +189,11 @@ document.addEventListener('DOMContentLoaded', () => {
                     fileItem.addEventListener('click', () => {
                         document.getElementById('transcriptText').textContent = job.transcript;
                         document.getElementById('transcriptContainer').style.display = 'block';
-    		        document.getElementById('transcriptContainer').scrollIntoView({ behavior: 'smooth' });
-			document.getElementById('transcriptTextJobID').setAttribute('data-job-id', job.job_id);
+                        document.getElementById('progressContainer').style.display = 'none';
+                        uploadArea.style.display = 'none';
+                        if (newTranscriptionWrapper) newTranscriptionWrapper.style.display = 'block';
+		        document.getElementById('transcriptContainer').scrollIntoView({ behavior: 'smooth' });
+				document.getElementById('transcriptTextJobID').setAttribute('data-job-id', job.job_id);
                     });
                 }
     
@@ -333,15 +363,21 @@ async function extractAudioFromVideo(videoFile) {
         }
     
 	let complete = false;
-        websocket = new WebSocket(`wss://transcribe.doodledome.org/ws/${jobId}`);
+        const wsScheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        const wsUrl = `${wsScheme}://${window.location.host}/ws/${jobId}`;
+        websocket = new WebSocket(wsUrl);
     
         websocket.onmessage = function(event) {
             const data = JSON.parse(event.data);
     
             switch(data.type) {
                 case 'progress':
-                    updateProgress(data.progress);
-                    updateStage(data.stage);
+                    if (['diarization','transcription','cleanup'].includes(data.stage)) {
+                        updateStageProgress(data.stage, data.progress);
+                        updateStageLabel(data.stage);
+                    } else {
+                        updateStageLabel(data.stage);
+                    }
                     break;
     
                 case 'transcript':
@@ -374,19 +410,46 @@ async function extractAudioFromVideo(videoFile) {
         };
     }
     
-    function updateStage(stage) {
-        document.getElementById('stageText').textContent = stage;
+    function updateStageLabel(stage) {
+        if (stageTextEl) {
+            const labels = {
+                diarization: 'Identifying Speakers...',
+                transcription: 'Transcribing Audio...',
+                cleanup: 'Cleaning Up Transcript...'
+            };
+            stageTextEl.textContent = labels[stage] || (stage || 'Initializing...');
+        }
     }
-    
-    function updateProgress(percent) {
-        progressBar.style.width = `${percent}%`;
-        progressText.textContent = `${percent}%`;
+
+    function updateStageProgress(stage, percent) {
+        let barEl, textEl;
+        if (stage === 'diarization') {
+            barEl = progressBarDiarization; textEl = progressTextDiarization;
+        } else if (stage === 'transcription') {
+            barEl = progressBarTranscription; textEl = progressTextTranscription;
+        } else if (stage === 'cleanup') {
+            barEl = progressBarCleanup; textEl = progressTextCleanup;
+        }
+        if (barEl && textEl) {
+            const pct = Math.max(0, Math.min(100, parseInt(percent, 10) || 0));
+            barEl.style.width = `${pct}%`;
+            textEl.textContent = `${pct}%`;
+        }
+    }
+
+    function resetProgressBars() {
+        updateStageLabel('Initializing...');
+        updateStageProgress('diarization', 0);
+        updateStageProgress('transcription', 0);
+        updateStageProgress('cleanup', 0);
     }
     
     function showError(message) {
         errorMessage.textContent = message;
         errorMessage.style.display = 'block';
         progressContainer.style.display = 'none';
+        uploadArea.style.display = 'block';
+        if (newTranscriptionWrapper) newTranscriptionWrapper.style.display = 'none';
         resetUploadArea();
     }
     
@@ -394,13 +457,15 @@ async function extractAudioFromVideo(videoFile) {
         transcriptText.textContent = text;
         transcriptContainer.style.display = 'block';
         progressContainer.style.display = 'none';
+        uploadArea.style.display = 'none';
+        if (newTranscriptionWrapper) newTranscriptionWrapper.style.display = 'block';
         document.getElementById('transcriptTextJobID').setAttribute('data-job-id', job_id);
     }
 
 
     async function fetchSpeakers(jobId) {
         try {
-            const response = await fetch(`${API_URL}/jobs/${jobId}/speakers`);
+            const response = await fetch(`${API_BASE}/jobs/${jobId}/speakers`);
             if (!response.ok) {
                 throw new Error('Failed to fetch speakers');
             }
@@ -444,7 +509,7 @@ async function extractAudioFromVideo(videoFile) {
         try {
             confirmRename.classList.add('loading');
             let currentJobId = document.getElementById('transcriptTextJobID').dataset.jobId;
-            const response = await fetch(`${API_URL}/jobs/${currentJobId}/speakers`, {
+            const response = await fetch(`${API_BASE}/jobs/${currentJobId}/speakers`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',

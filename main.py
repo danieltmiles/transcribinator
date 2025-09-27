@@ -131,7 +131,7 @@ async def process_audio(job_id: str, file_path: Path, num_speakers: int):
         # Example:
         # model = YourTranscriptionModel()
         # transcript = model.transcribe(str(file_path))
-        progress_send_stream, progress_receive_stream = create_memory_object_stream[int]()
+        progress_send_stream, progress_receive_stream = create_memory_object_stream[dict]()
         transcript_send_stream, transcript_receive_stream = create_memory_object_stream[str]()
         # def handle_tgerror(excgroup: ExceptionGroup) -> None:
         #     for exc in excgroup.exceptions:
@@ -140,23 +140,33 @@ async def process_audio(job_id: str, file_path: Path, num_speakers: int):
         try:
             async with create_task_group() as tg:
                 tg.start_soon(ai_process_audio, file_path, num_speakers, 1.0, progress_send_stream, transcript_send_stream)
-                #progress: int = await progress_receive_stream.receive()
-                progress: int = 0
-                while progress < 100:
-                    job = active_jobs[job_id]
-                    if job and job.websocket and job.websocket.client_state == WebSocketState.CONNECTED:
-                        try:
-                            await job.websocket.send_json({
-                                "type": "progress",
-                                "progress": progress,
-                                "stage": "Transcribing audio"
-                            })
-                        except WebSocketDisconnect:
-                            logger.error("web socket has disconnected")
-                            active_jobs[job_id] = None
+                stage_progress = {"diarization": 0, "transcription": 0, "cleanup": 0}
+                cleanup_done = False
+                while not cleanup_done:
+                    prog_msg = await progress_receive_stream.receive()
+                    # Expecting dict like {"stage": "diarization"|"transcription"|"cleanup", "progress": int}
+                    if isinstance(prog_msg, dict):
+                        stage = prog_msg.get("stage")
+                        progress = int(prog_msg.get("progress", 0))
+                        if stage in stage_progress:
+                            stage_progress[stage] = progress
+                        job = active_jobs[job_id]
+                        if job and job.websocket and job.websocket.client_state == WebSocketState.CONNECTED:
+                            try:
+                                await job.websocket.send_json({
+                                    "type": "progress",
+                                    "stage": stage,
+                                    "progress": progress
+                                })
+                            except WebSocketDisconnect:
+                                logger.error("web socket has disconnected")
+                                active_jobs[job_id] = None
+                        else:
+                            logger.info("no websocket, not sending progress")
+                        if stage == "cleanup" and progress >= 100:
+                            cleanup_done = True
                     else:
-                        logger.info("no websocket, not sending progress")
-                    progress = await progress_receive_stream.receive()
+                        logger.warning(f"Unexpected progress message: {prog_msg}")
                 transcript = await transcript_receive_stream.receive()
                 update_job_status(job_id, "completed", transcript)
         except* Exception as excgroup:
@@ -495,7 +505,7 @@ async def signup(user: UserCreate):
     return {"message": "User created successfully"}
 
 @app.post("/auth/login")
-async def login(user: UserCreate):
+async def login(user: UserCreate, request: Request):
     db_user = get_user_by_email(user.email)
     if not db_user:
         raise HTTPException(
@@ -517,12 +527,16 @@ async def login(user: UserCreate):
         content={"redirect": "/"},
         status_code=200
     )
+    # Determine scheme, honoring reverse proxy headers
+    forwarded_proto = (request.headers.get('x-forwarded-proto') or request.headers.get('X-Forwarded-Proto') or '').split(',')[0].strip()
+    scheme = forwarded_proto or request.url.scheme
+    is_secure = scheme == 'https'
     response.set_cookie(
         key="Authorization",
         value=f"Bearer {access_token}",
         httponly=True,
         max_age=1800,  # 30 minutes
-        secure=True,  # For HTTPS
+        secure=is_secure,  # Only set Secure on HTTPS
         samesite="lax"
     )
     return response
