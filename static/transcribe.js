@@ -7,32 +7,34 @@ let stageTextEl,
     progressBarTranscription, progressTextTranscription,
     progressBarCleanup, progressTextCleanup;
 let newTranscriptionButton, newTranscriptionWrapper;
+let speakerDialog, currentFile, websocket;
 
 document.addEventListener('DOMContentLoaded', () => {
-    const uploadArea = document.getElementById('uploadArea');
-    const progressContainer = document.getElementById('progressContainer');
-    const errorMessage = document.getElementById('errorMessage');
-    const transcriptContainer = document.getElementById('transcriptContainer');
-    const transcriptText = document.getElementById('transcriptText');
-    const copyButton = document.getElementById('copyButton');
-    const fileNameDisplay = document.getElementById('fileNameDisplay');
+    uploadArea = document.getElementById('uploadArea');
+    progressContainer = document.getElementById('progressContainer');
+    errorMessage = document.getElementById('errorMessage');
+    transcriptContainer = document.getElementById('transcriptContainer');
+    transcriptText = document.getElementById('transcriptText');
+    copyButton = document.getElementById('copyButton');
+    fileNameDisplay = document.getElementById('fileNameDisplay');
 
-    const speakerRenameDialog = document.getElementById('speakerRenameDialog');
-    const speakerInputs = document.getElementById('speakerInputs');
-    const cancelRename = document.getElementById('cancelRename');
-    const confirmRename = document.getElementById('confirmRename');
-    const renameSpeakersButton = document.getElementById('renameSpeakersButton');
+    speakerDialog = document.getElementById('speakerDialog');
+    speakerRenameDialog = document.getElementById('speakerRenameDialog');
+    speakerInputs = document.getElementById('speakerInputs');
+    cancelRename = document.getElementById('cancelRename');
+    confirmRename = document.getElementById('confirmRename');
+    renameSpeakersButton = document.getElementById('renameSpeakersButton');
 
-    const stageTextEl = document.getElementById('stageText');
-    const progressBarDiarization = document.getElementById('progressBarDiarization');
-    const progressTextDiarization = document.getElementById('progressTextDiarization');
-    const progressBarTranscription = document.getElementById('progressBarTranscription');
-    const progressTextTranscription = document.getElementById('progressTextTranscription');
-    const progressBarCleanup = document.getElementById('progressBarCleanup');
-    const progressTextCleanup = document.getElementById('progressTextCleanup');
+    stageTextEl = document.getElementById('stageText');
+    progressBarDiarization = document.getElementById('progressBarDiarization');
+    progressTextDiarization = document.getElementById('progressTextDiarization');
+    progressBarTranscription = document.getElementById('progressBarTranscription');
+    progressTextTranscription = document.getElementById('progressTextTranscription');
+    progressBarCleanup = document.getElementById('progressBarCleanup');
+    progressTextCleanup = document.getElementById('progressTextCleanup');
 
-    const newTranscriptionButton = document.getElementById('newTranscriptionButton');
-    const newTranscriptionWrapper = document.getElementById('newTranscriptionWrapper');
+    newTranscriptionButton = document.getElementById('newTranscriptionButton');
+    newTranscriptionWrapper = document.getElementById('newTranscriptionWrapper');
     if (newTranscriptionButton) {
         newTranscriptionButton.addEventListener('click', () => {
             window.location.reload();
