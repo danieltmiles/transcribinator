@@ -100,7 +100,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (selectedFileNameEl) selectedFileNameEl.textContent = 'None selected';
     });
 
-    async function uploadFile(file, numSpeakers, fileName) {
+    async function uploadFile(file, fileName) {
         // Reset UI
         errorMessage.style.display = 'none';
         transcriptContainer.style.display = 'none';
@@ -112,7 +112,6 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             const formData = new FormData();
             formData.append('file', file);
-            formData.append('num_speakers', numSpeakers);
             formData.append('file_name', fileName);
     
             const response = await fetch(`${API_BASE}/upload`, {
@@ -206,11 +205,6 @@ document.addEventListener('DOMContentLoaded', () => {
     
     // Handle dialog buttons
     document.getElementById('confirmUpload').addEventListener('click', async () => {
-        const speakers = parseInt(numSpeakers.value);
-        if (speakers < 1 || speakers > 10) {
-            alert('Please enter a number between 1 and 10');
-            return;
-        }
         const fileName = document.getElementById('fileName').value.trim();
         speakerDialog.style.display = 'none';
         if (currentFile) {
@@ -226,7 +220,7 @@ document.addEventListener('DOMContentLoaded', () => {
               );
               currentFile = audioFile;
             }
-            uploadFile(currentFile, speakers, fileName);
+            uploadFile(currentFile, fileName);
             currentFile = null;
         }
     });
@@ -564,4 +558,3 @@ async function extractAudioFromVideo(videoFile) {
     
     loadPreviousTranscripts();
 });
-

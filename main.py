@@ -110,7 +110,7 @@ UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 
-async def process_audio(job_id: str, file_path: Path, num_speakers: int):
+async def process_audio(job_id: str, file_path: Path):
     """
     Process audio file and send progress updates via WebSocket.
     Replace the sleep calls with your actual AI model processing.
@@ -139,7 +139,7 @@ async def process_audio(job_id: str, file_path: Path, num_speakers: int):
         #     raise exc
         try:
             async with create_task_group() as tg:
-                tg.start_soon(ai_process_audio, file_path, num_speakers, 1.0, progress_send_stream, transcript_send_stream)
+                tg.start_soon(ai_process_audio, file_path, 1.0, progress_send_stream, transcript_send_stream)
                 stage_progress = {"diarization": 0, "transcription": 0, "cleanup": 0}
                 cleanup_done = False
                 while not cleanup_done:
@@ -308,7 +308,6 @@ async def read_transcribe():
 async def upload_file(
         user: User = Depends(get_current_user),
         file: UploadFile = File(...),
-        num_speakers: int = Form(...),
         file_name: str = Form(...),
         background_tasks: BackgroundTasks = None):
     # Generate unique job ID
@@ -333,7 +332,7 @@ async def upload_file(
     save_transcription(job, user.email)
 
     # Start processing in background
-    background_tasks.add_task(process_audio, job_id, file_path, num_speakers)
+    background_tasks.add_task(process_audio, job_id, file_path)
 
     return {"job_id": job_id}
 
@@ -563,5 +562,3 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-

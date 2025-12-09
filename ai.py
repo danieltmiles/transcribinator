@@ -99,13 +99,39 @@ def format_timestamp(seconds):
     remaining_seconds = remaining_seconds % one_minute
     return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
 
-async def process_audio(audio_file_path: str, num_speakers: int, min_segment_length: float, progress_send_stream: MemoryObjectSendStream[dict], transcript_send_stream: MemoryObjectSendStream[str]):
+def find_optimal_speakers(embeddings, max_speakers=10):
+    """
+    Find optimal number of speakers using silhouette analysis and clustering metrics.
+    """
+    from sklearn.cluster import AgglomerativeClustering
+    from sklearn.metrics import silhouette_score
+    
+    print("Finding optimal number of speakers...")
+    best_score = -1
+    best_n_speakers = 2
+    
+    # Try different numbers of speakers
+    for n_speakers in range(2, min(max_speakers + 1, len(embeddings))):
+        clustering = AgglomerativeClustering(n_clusters=n_speakers, linkage='average')
+        labels = clustering.fit_predict(embeddings)
+        
+        # Calculate silhouette score (higher is better)
+        score = silhouette_score(embeddings, labels)
+        print(f"  {n_speakers} speakers: silhouette score = {score:.3f}")
+        
+        if score > best_score:
+            best_score = score
+            best_n_speakers = n_speakers
+    
+    print(f"Optimal number of speakers: {best_n_speakers} (score: {best_score:.3f})")
+    return best_n_speakers
+
+async def process_audio(audio_file_path: str, min_segment_length: float, progress_send_stream: MemoryObjectSendStream[dict], transcript_send_stream: MemoryObjectSendStream[str]):
     """
     Process audio file for speaker identification and transcription
 
     Parameters:
     - audio_file_path: Path to the audio file
-    - num_speakers: Expected number of speakers
     - min_segment_length: Minimum segment length in seconds
     """
     import os
@@ -190,18 +216,31 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
     # labels = clustering.fit_predict(embeddings)
     # num_speakers = len(np.unique(labels))
     # print(f"num speakers: {num_speakers}")
-    print(f"Clustering speakers")
+    print(f"Performing speaker diarization on {len(embeddings)} segments")
     embeddings = np.array(embeddings)
     
     # Normalize embeddings
     from sklearn.preprocessing import normalize
     embeddings_normalized = normalize(embeddings, norm='l2', axis=1)
     
+    # Use optimal number of speakers detection
+    num_speakers = find_optimal_speakers(embeddings_normalized, max_speakers=10)
+    print(f"Estimated number of speakers: {num_speakers}")
+    
+    # Perform final clustering with determined number of speakers
     from sklearn.cluster import AgglomerativeClustering
-    clustering = AgglomerativeClustering(n_clusters=None, distance_threshold=0.08)
+    clustering = AgglomerativeClustering(n_clusters=num_speakers, linkage='average')
     labels = clustering.fit_predict(embeddings_normalized)
-    num_speakers = len(np.unique(labels))
-    print(f"num speakers: {num_speakers}")
+    
+    # Assign speaker labels to segments and print some statistics
+    unique_speakers = np.unique(labels)
+    print(f"Final speaker count: {len(unique_speakers)}")
+    
+    # Print segment distribution per speaker
+    for speaker_id in unique_speakers:
+        speaker_segments = np.sum(labels == speaker_id)
+        percentage = (speaker_segments / len(labels)) * 100
+        print(f"Speaker {speaker_id}: {speaker_segments} segments ({percentage:.1f}%)")
     
     # Process segments with speaker labels and transcription
     raw_segments = []
