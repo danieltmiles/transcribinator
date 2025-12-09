@@ -183,11 +183,25 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
     await progress_send_stream.send({"stage": "diarization", "progress": 100})
     await asyncio.sleep(0.1)
     
-    print(f"Clustering speakers (target: {num_speakers} speakers)...")
+    # print(f"Clustering speakers")
+    # embeddings = np.array(embeddings)
+    # from sklearn.cluster import AgglomerativeClustering
+    # clustering = AgglomerativeClustering(n_clusters=None, distance_threshold=0.05)
+    # labels = clustering.fit_predict(embeddings)
+    # num_speakers = len(np.unique(labels))
+    # print(f"num speakers: {num_speakers}")
+    print(f"Clustering speakers")
     embeddings = np.array(embeddings)
+    
+    # Normalize embeddings
+    from sklearn.preprocessing import normalize
+    embeddings_normalized = normalize(embeddings, norm='l2', axis=1)
+    
     from sklearn.cluster import AgglomerativeClustering
-    clustering = AgglomerativeClustering(n_clusters=num_speakers)
-    labels = clustering.fit_predict(embeddings)
+    clustering = AgglomerativeClustering(n_clusters=None, distance_threshold=0.08)
+    labels = clustering.fit_predict(embeddings_normalized)
+    num_speakers = len(np.unique(labels))
+    print(f"num speakers: {num_speakers}")
     
     # Process segments with speaker labels and transcription
     raw_segments = []
@@ -291,6 +305,7 @@ async def process_audio(audio_file_path: str, num_speakers: int, min_segment_len
     del ModelHaver._instance
     ModelHaver._instance = None
     model_name = "Qwen/Qwen2.5-7B-Instruct"
+    # model_name = "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8"
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float16,  # Force FP16

@@ -27,3 +27,4 @@ protobuf
 bitsandbytes
 jupyter
 ctransformers
+torchcodec
