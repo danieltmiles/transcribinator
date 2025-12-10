@@ -99,7 +99,7 @@ def format_timestamp(seconds):
     remaining_seconds = remaining_seconds % one_minute
     return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
 
-def find_optimal_speakers(embeddings, max_speakers=10):
+def find_optimal_speakers(embeddings, max_speakers=100):
     """
     Find optimal number of speakers using silhouette analysis and clustering metrics.
     """
@@ -173,7 +173,9 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
     window_size = int(sr * min_segment_length * 3)  # 3x min_segment_length windows
     stride = int(sr * min_segment_length * 2)       # 2x min_segment_length stride
     
-    segments = []
+    # Separate segments for diarization (speaker identification) and transcription
+    diarization_segments = []
+    all_segments = []
     embeddings = []
     
     print(f"Processing audio segments from 0 through {len(signal)} with stride {stride}")
@@ -184,23 +186,25 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
         end = min(start + window_size, len(signal))
         segment = signal[start:end]
         
-        if len(segment) < sr * min_segment_length:
-            # Still update progress based on iteration index
-            current_progress = int((idx / diar_total_iters) * 100)
-            if current_progress > diar_last_progress:
-                await progress_send_stream.send({"stage": "diarization", "progress": current_progress})
-                await asyncio.sleep(0.05)
-                diar_last_progress = current_progress
-            continue
-            
-        embedding = speaker_recognition.encode_batch(segment.unsqueeze(0))
-        embeddings.append(embedding.squeeze().cpu().numpy())
-        
-        segments.append({
+        # Always add to transcription segments (covers all audio)
+        all_segments.append({
             'start': start / sr,
             'end': end / sr,
             'audio': segment
         })
+        
+        # Only add to diarization if segment is long enough for good speaker embeddings
+        if len(segment) >= sr * min_segment_length:
+            embedding = speaker_recognition.encode_batch(segment.unsqueeze(0))
+            embeddings.append(embedding.squeeze().cpu().numpy())
+            
+            diarization_segments.append({
+                'start': start / sr,
+                'end': end / sr,
+                'audio': segment,
+                'segment_index': len(all_segments) - 1  # Link back to all_segments
+            })
+        
         current_progress = int((idx / diar_total_iters) * 100)
         if current_progress > diar_last_progress:
             await progress_send_stream.send({"stage": "diarization", "progress": current_progress})
@@ -242,24 +246,44 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
         percentage = (speaker_segments / len(labels)) * 100
         print(f"Speaker {speaker_id}: {speaker_segments} segments ({percentage:.1f}%)")
     
+    # Create speaker assignment for all segments based on temporal overlap
+    def assign_speaker_to_segment(segment_start, segment_end):
+        """Assign speaker to a segment based on temporal overlap with diarization segments"""
+        best_overlap = 0
+        best_speaker = "Speaker_0"  # default fallback
+        
+        for i, diar_seg in enumerate(diarization_segments):
+            # Calculate overlap between transcription segment and diarization segment
+            overlap_start = max(segment_start, diar_seg['start'])
+            overlap_end = min(segment_end, diar_seg['end'])
+            overlap = max(0, overlap_end - overlap_start)
+            
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_speaker = f"Speaker_{labels[i]}"
+        
+        return best_speaker
+    
     # Process segments with speaker labels and transcription
     raw_segments = []
     import os
     # temp_dir = "temp_segments"
     # os.makedirs(temp_dir, exist_ok=True)
     
-    print(f"Transcribing {len(segments)} segments...")
+    print(f"Transcribing {len(all_segments)} segments...")
     await progress_send_stream.send({"stage": "transcription", "progress": 0})
     last_progress = 0
     await asyncio.sleep(0.1)
     results = []
-    for i, segment in tqdm.tqdm(enumerate(segments), total=len(segments)):
-        current_progress = int((i / len(segments)) * 100)
+    for i, segment in tqdm.tqdm(enumerate(all_segments), total=len(all_segments)):
+        current_progress = int((i / len(all_segments)) * 100)
         if current_progress > last_progress:
             await progress_send_stream.send({"stage": "transcription", "progress": current_progress})
             await asyncio.sleep(0.1)
             last_progress = current_progress
-        speaker = f"Speaker_{labels[i]}"
+        
+        # Assign speaker based on temporal overlap with diarization segments
+        speaker = assign_speaker_to_segment(segment['start'], segment['end'])
         
         # temp_file = os.path.join(temp_dir, f"segment_{i}.wav")
         # sf.write(temp_file, segment['audio'].numpy(), sr)
