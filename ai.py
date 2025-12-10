@@ -11,6 +11,8 @@ from speechbrain.pretrained import SpeakerRecognition
 from pydub import AudioSegment
 from transformers import Qwen2ForCausalLM, Qwen2TokenizerFast, AutoModelForCausalLM, AutoTokenizer
 
+from speaker_counting_parallel import find_optimal_speakers_multi_metric_parallel
+
 device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
@@ -99,7 +101,7 @@ def format_timestamp(seconds):
     remaining_seconds = remaining_seconds % one_minute
     return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
 
-def find_optimal_speakers(embeddings, max_speakers=100):
+def find_optimal_speakers(embeddings, max_speakers=30):
     """
     Find optimal number of speakers using silhouette analysis and clustering metrics.
     """
@@ -228,7 +230,12 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
     embeddings_normalized = normalize(embeddings, norm='l2', axis=1)
     
     # Use optimal number of speakers detection
-    num_speakers = find_optimal_speakers(embeddings_normalized, max_speakers=10)
+    # num_speakers = find_optimal_speakers(embeddings_normalized, max_speakers=10)
+    num_speakers, labels = find_optimal_speakers_multi_metric_parallel(
+        embeddings_normalized,
+        max_speakers=250,
+        n_processes=None  # Auto-detect optimal number of processes
+    )
     print(f"Estimated number of speakers: {num_speakers}")
     
     # Perform final clustering with determined number of speakers

@@ -28,3 +28,4 @@ bitsandbytes
 jupyter
 ctransformers
 torchcodec
+matplotlib
