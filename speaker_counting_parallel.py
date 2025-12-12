@@ -51,7 +51,7 @@ def find_optimal_speakers_multi_metric_parallel(embeddings, max_speakers=30, min
     if n_processes is None:
         n_processes = min(cpu_count(), max_speakers - min_speakers + 1)
     
-    print(f"Evaluating speaker counts with multiple metrics using {n_processes} CPU processes...")
+    print(f"Evaluating speaker counts with multiple metrics using {n_processes} CPU processes up to {max_speakers} speakers...")
     
     # Test range of speaker counts
     speaker_range = range(min_speakers, min(max_speakers + 1, len(embeddings)))
@@ -70,9 +70,11 @@ def find_optimal_speakers_multi_metric_parallel(embeddings, max_speakers=30, min
             total=len(args_list),
             desc="Computing metrics"
         ))
+    print("finished computing metrics, starting to organize results")
     
     # Organize results
     for n_speakers, metrics in results:
+        print(f"colating results for {n_speakers}")
         metrics_results[n_speakers] = metrics
         print(f"  {n_speakers} speakers: sil={metrics['silhouette']:.3f}, "
               f"ch={metrics['calinski_harabasz']:.1f}, db={metrics['davies_bouldin']:.3f}")
