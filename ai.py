@@ -408,8 +408,13 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
     await progress_send_stream.send({"stage": "cleanup", "progress": 100})
     await transcript_send_stream.send(produce_transcript(transcript))
     LOGGER.info(f"{transcript}")
+    
+    # Clean up all models from memory
     del model
-    model = None
+    del tokenizer  
+    del speaker_recognition
+    unload_models_from_memory()
+    
     return transcript
 
 def save_transcript(transcript, output_file):
@@ -464,6 +469,36 @@ def generate_from_prompt(prompt: str, model: Qwen2ForCausalLM, tokenizer: Qwen2T
         repetition_penalty=1.2
     )
     return tokenizer.decode(outputs[0], skip_special_tokens=False)
+
+def unload_models_from_memory():
+    """
+    Comprehensive function to unload all models from memory and free GPU/CPU resources
+    """
+    import gc
+    
+    print("Unloading models from memory...")
+    
+    # Clear ModelHaver instance (Whisper model)
+    if hasattr(ModelHaver, '_instance') and ModelHaver._instance is not None:
+        if hasattr(ModelHaver._instance, 'whisper_model'):
+            del ModelHaver._instance.whisper_model
+        del ModelHaver._instance
+        ModelHaver._instance = None
+        print("- Whisper model unloaded")
+    
+    # Force garbage collection
+    gc.collect()
+    
+    # Clear GPU cache if available
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print("- CUDA memory cache cleared")
+    
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+        print("- MPS memory cache cleared")
+    
+    print("Memory cleanup completed")
 
 def llm_clean(text: str, model: Qwen2ForCausalLM, tokenizer: Qwen2TokenizerFast) -> str | None:
     prompt_template = """You are a transcript editor. The following text was transcribed from an audio recording by an unskilled person who
