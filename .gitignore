@@ -4,3 +4,4 @@ transcriptions.db
 pretrained_models
 .idea
 *.pyc
+hf_token.txt

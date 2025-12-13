@@ -18,6 +18,32 @@ from speaker_counting_parallel import find_optimal_speakers_multi_metric_paralle
 from utils import diarized_segment_iter, assign_speaker_to_segment, normalize_audio
 
 
+def load_hf_token(token_file="hf_token.txt"):
+    """Load HuggingFace token from a file.
+    
+    Args:
+        token_file: Path to the token file (default: hf_token.txt)
+        
+    Returns:
+        str: The token string
+        
+    Raises:
+        FileNotFoundError: If the token file doesn't exist
+        ValueError: If the token file is empty
+    """
+    token_path = os.path.join(os.path.dirname(__file__), token_file)
+    if not os.path.exists(token_path):
+        raise FileNotFoundError(f"Token file not found: {token_path}")
+    
+    with open(token_path, 'r') as f:
+        token = f.read().strip()
+    
+    if not token:
+        raise ValueError(f"Token file is empty: {token_path}")
+    
+    return token
+
+
 class TqdmProgressHook:
     """Custom hook using tqdm for progress display"""
 
@@ -202,25 +228,31 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
 
     pipeline = Pipeline.from_pretrained(
         checkpoint="pyannote/speaker-diarization-community-1",
-        token="REDACTED",
+        token=load_hf_token(),
     ).to(torch.device(device))
+    print("1")
 
     # Ensure waveform is 2D (channel, time) as required by pyannote
     waveform = signal
     if signal.dim() == 1:
         waveform = signal.unsqueeze(0)
+    print("2")
 
     with TqdmProgressHook(progress_send_stream, "embeddings") as hook:
         diarization: DiarizeOutput = pipeline({"waveform": waveform, "sample_rate": sr}, hook=hook)
+        print("3")
+    print("4")
 
     # Create list of segments for total count
     segments_list = list(diarized_segment_iter(signal, diarization, sr))
+    print("5")
     await progress_send_stream.send({"stage": "transcription", "progress": 0})
     last_progress = 0
     await asyncio.sleep(0.1)
     results = []
     raw_segments = []
     for i, segment in tqdm.tqdm(enumerate(segments_list)):
+        print(f"6.{i}")
         current_progress = int((i / len(segments_list)) * 100)
         if current_progress > last_progress:
             await progress_send_stream.send({"stage": "transcription", "progress": current_progress})
@@ -229,7 +261,8 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
         
         # Assign speaker based on temporal overlap with diarization segments
         speaker = assign_speaker_to_segment(diarization, segment['start'], segment['end'])
-        
+        print(f"7.{i}")
+
         if i % 10 == 0:
             await asyncio.sleep(0.1)
         print(f"transcribing segment {i}", flush=True)
@@ -240,6 +273,7 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
             # initial_prompt="Um, uh, and other hesitation sounds should be transcribed as such.",
             word_timestamps=True,
         )
+        print(f"8.{i}")
         text = ""
         for segment_segment in result.get("segments", []):
             segment_words = segment_segment.get("words", [])
@@ -258,6 +292,7 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
                 if probability > 0.3:
                     text += word_word
         text = text.strip()
+        print(f"9.{i}")
 
         # os.remove(temp_file)
         
@@ -271,7 +306,8 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
             results.append(result)
     with open("results.json", "w") as fl:
         json.dump(results, fl, indent=4)
-    
+    print(f"10")
+
     # Merge segments from the same speaker and clean overlapping text
     transcript = []
     current_speaker = None
