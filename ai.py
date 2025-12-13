@@ -226,10 +226,14 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
     await asyncio.sleep(0.1)
     print(f"loaded models in {end - start} seconds")
 
-    pipeline = Pipeline.from_pretrained(
-        checkpoint="pyannote/speaker-diarization-community-1",
-        token=load_hf_token(),
-    ).to(torch.device(device))
+    try:
+        pipeline = Pipeline.from_pretrained(
+            checkpoint="pyannote/speaker-diarization-community-1",
+            token=load_hf_token(),
+        ).to(torch.device(device))
+    except Exception as exp:
+        print(exp)
+        raise
     print("1")
 
     # Ensure waveform is 2D (channel, time) as required by pyannote
