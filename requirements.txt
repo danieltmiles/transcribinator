@@ -13,7 +13,7 @@ pydub-ffmpeg-wav
 anyio
 transformers
 optimum
-auto-gptq
+# auto-gptq
 # libosa
 pytest
 pytest-asyncio
@@ -29,3 +29,6 @@ jupyter
 ctransformers
 torchcodec
 matplotlib
+pyannote.audio
+onnxruntime
+msgpack
