@@ -5,6 +5,11 @@ import time
 from io import StringIO
 
 import torch
+if torch.cuda.is_available():
+    _original_load = torch.load
+    torch.load = lambda *args, **kwargs: _original_load(*args, **{**kwargs, 'weights_only': False})
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 import tqdm
 import torchaudio
 from anyio.streams.memory import MemoryObjectSendStream
