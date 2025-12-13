@@ -202,7 +202,7 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
 
     pipeline = Pipeline.from_pretrained(
         checkpoint="pyannote/speaker-diarization-community-1",
-        token="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",
+        token="REDACTED",
     ).to(torch.device(device))
 
     # Ensure waveform is 2D (channel, time) as required by pyannote
