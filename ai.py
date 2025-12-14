@@ -3,6 +3,7 @@ import json
 import os
 import time
 from io import StringIO
+from queue import Queue
 
 import torch
 if torch.cuda.is_available():
@@ -11,12 +12,9 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 import tqdm
-import torchaudio
 from anyio.streams.memory import MemoryObjectSendStream
 from pyannote.audio import Pipeline
 from pyannote.audio.pipelines.speaker_diarization import DiarizeOutput
-from speechbrain.pretrained import SpeakerRecognition
-from pydub import AudioSegment
 from transformers import Qwen2ForCausalLM, Qwen2TokenizerFast, AutoModelForCausalLM, AutoTokenizer
 
 from speaker_counting_parallel import find_optimal_speakers_multi_metric_parallel
@@ -57,6 +55,7 @@ class TqdmProgressHook:
         self.step_name = None
         self.progress_send_stream = progress_send_stream
         self.important_step_name = important_step_name
+        self.progress_queue = Queue()
 
     def __enter__(self):
         return self
@@ -84,14 +83,24 @@ class TqdmProgressHook:
             self.pbar = tqdm.tqdm(total=total, desc=step_name, unit="it")
 
         if self.important_step_name == None or step_name == self.important_step_name:
-            progress_percentage = int(completed / total)
-            asyncio.create_task(self.progress_send_stream.send({"stage": "diarization", "progress": progress_percentage}))
+            progress_percentage = int(completed / total * 100)
+            # Put progress update in queue instead of creating orphaned task
+            self.progress_queue.put({"stage": "diarization", "progress": progress_percentage})
 
         # Update progress
         if self.pbar is not None:
             self.pbar.n = completed
             self.pbar.total = total
             self.pbar.refresh()
+
+    async def flush_progress(self):
+        """Send all queued progress updates to the stream"""
+        while not self.progress_queue.empty():
+            try:
+                progress_data = self.progress_queue.get_nowait()
+                await self.progress_send_stream.send(progress_data)
+            except:
+                break
 
 
 device = "cpu"
@@ -182,33 +191,6 @@ def format_timestamp(seconds):
     remaining_seconds = remaining_seconds % one_minute
     return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
 
-def find_optimal_speakers(embeddings, max_speakers=30):
-    """
-    Find optimal number of speakers using silhouette analysis and clustering metrics.
-    """
-    from sklearn.cluster import AgglomerativeClustering
-    from sklearn.metrics import silhouette_score
-    
-    print("Finding optimal number of speakers...")
-    best_score = -1
-    best_n_speakers = 2
-    
-    # Try different numbers of speakers
-    for n_speakers in range(2, min(max_speakers + 1, len(embeddings))):
-        clustering = AgglomerativeClustering(n_clusters=n_speakers, linkage='average')
-        labels = clustering.fit_predict(embeddings)
-        
-        # Calculate silhouette score (higher is better)
-        score = silhouette_score(embeddings, labels)
-        print(f"  {n_speakers} speakers: silhouette score = {score:.3f}")
-        
-        if score > best_score:
-            best_score = score
-            best_n_speakers = n_speakers
-    
-    print(f"Optimal number of speakers: {best_n_speakers} (score: {best_score:.3f})")
-    return best_n_speakers
-
 async def process_audio(audio_file_path: str, min_segment_length: float, progress_send_stream: MemoryObjectSendStream[dict], transcript_send_stream: MemoryObjectSendStream[str]):
     """
     Process audio file for speaker identification and transcription
@@ -227,41 +209,33 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
         raise ImportError(
             "Error loading Whisper model. Please ensure you have openai-whisper installed, not whisper"
         )
+    pipeline = Pipeline.from_pretrained(
+        checkpoint="pyannote/speaker-diarization-community-1",
+        token=load_hf_token(),
+    ).to(torch.device(device))
+
     end = time.time()
     await asyncio.sleep(0.1)
     print(f"loaded models in {end - start} seconds")
-
-    try:
-        pipeline = Pipeline.from_pretrained(
-            checkpoint="pyannote/speaker-diarization-community-1",
-            token=load_hf_token(),
-        ).to(torch.device(device))
-    except Exception as exp:
-        print(exp)
-        raise
-    print("1")
 
     # Ensure waveform is 2D (channel, time) as required by pyannote
     waveform = signal
     if signal.dim() == 1:
         waveform = signal.unsqueeze(0)
-    print("2")
 
     with TqdmProgressHook(progress_send_stream, "embeddings") as hook:
         diarization: DiarizeOutput = pipeline({"waveform": waveform, "sample_rate": sr}, hook=hook)
-        print("3")
-    print("4")
+        # Flush all queued progress updates to the websocket
+        await hook.flush_progress()
 
     # Create list of segments for total count
     segments_list = list(diarized_segment_iter(signal, diarization, sr))
-    print("5")
     await progress_send_stream.send({"stage": "transcription", "progress": 0})
     last_progress = 0
     await asyncio.sleep(0.1)
     results = []
     raw_segments = []
     for i, segment in tqdm.tqdm(enumerate(segments_list)):
-        print(f"6.{i}")
         current_progress = int((i / len(segments_list)) * 100)
         if current_progress > last_progress:
             await progress_send_stream.send({"stage": "transcription", "progress": current_progress})
@@ -270,11 +244,9 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
         
         # Assign speaker based on temporal overlap with diarization segments
         speaker = assign_speaker_to_segment(diarization, segment['start'], segment['end'])
-        print(f"7.{i}")
 
         if i % 10 == 0:
             await asyncio.sleep(0.1)
-        print(f"transcribing segment {i}", flush=True)
         result = whisper_model.transcribe(
             segment['audio'],
             temperature=0.2,  # Low temperature. Conservative, but small creative freedom
@@ -282,7 +254,6 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
             # initial_prompt="Um, uh, and other hesitation sounds should be transcribed as such.",
             word_timestamps=True,
         )
-        print(f"8.{i}")
         text = ""
         for segment_segment in result.get("segments", []):
             segment_words = segment_segment.get("words", [])
@@ -301,7 +272,6 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
                 if probability > 0.3:
                     text += word_word
         text = text.strip()
-        print(f"9.{i}")
 
         # os.remove(temp_file)
         
@@ -315,7 +285,6 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
             results.append(result)
     with open("results.json", "w") as fl:
         json.dump(results, fl, indent=4)
-    print(f"10")
 
     # Merge segments from the same speaker and clean overlapping text
     transcript = []
@@ -327,7 +296,8 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
     for segment in raw_segments:
         if segment['speaker'] != current_speaker:
             if current_speaker and current_texts:
-                cleaned_texts = clean_overlapping_text(current_texts)
+                # cleaned_texts = clean_overlapping_text(current_texts)
+                cleaned_texts = current_texts
                 if cleaned_texts:
                     transcript.append({
                         'speaker': current_speaker,
@@ -374,13 +344,10 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
     await progress_send_stream.send({"stage": "transcription", "progress": 100})
 
     await progress_send_stream.send({"stage": "cleanup", "progress": 0})
-    for i, segment in enumerate(transcript):
+    for i, segment in tqdm.tqdm(enumerate(transcript)):
         current_progress = int((i / max(1, len(transcript))) * 100)
         await progress_send_stream.send({"stage": "cleanup", "progress": current_progress})
-        await asyncio.sleep(0.1)
-        print(f"\ntext:\n{segment['text']}\n")
         cleaned_segment_text = llm_clean(segment["text"], model, tokenizer)
-        print(f"\ncleaned text:\n{cleaned_segment_text}\n")
         transcript[i]["text"] = cleaned_segment_text
     
     # Clean up temp directory
@@ -399,57 +366,6 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
     return transcript
 
 
-
-
-# async def diarialize_old(min_segment_length: float, progress_send_stream: MemoryObjectSendStream[dict],
-#                          signal: Tensor | Any, speaker_recognition: SpeakerRecognition | None,
-#                          sr: Literal[16000] | int) -> tuple[list[Any], list[Any]]:
-#     # Parameters for segmentation
-#     window_size = int(sr * min_segment_length * 3)  # 3x min_segment_length windows
-#     stride = int(sr * min_segment_length * 2)  # 2x min_segment_length stride
-#
-#     # Separate segments for diarization (speaker identification) and transcription
-#     diarization_segments = []
-#     all_segments = []
-#     embeddings = []
-#
-#     print(f"Processing audio segments from 0 through {len(signal)} with stride {stride}")
-#     await progress_send_stream.send({"stage": "diarization", "progress": 0})
-#     diar_last_progress = 0
-#     diar_total_iters = max(1, len(range(0, len(signal), stride)))
-#     for idx, start in enumerate(tqdm.tqdm(range(0, len(signal), stride), total=diar_total_iters)):
-#         end = min(start + window_size, len(signal))
-#         segment = signal[start:end]
-#
-#         # Always add to transcription segments (covers all audio)
-#         all_segments.append({
-#             'start': start / sr,
-#             'end': end / sr,
-#             'audio': segment
-#         })
-#
-#         # Only add to diarization if segment is long enough for good speaker embeddings
-#         if len(segment) >= sr * min_segment_length:
-#             embedding = speaker_recognition.encode_batch(segment.unsqueeze(0))
-#             embeddings.append(embedding.squeeze().cpu().numpy())
-#
-#             diarization_segments.append({
-#                 'start': start / sr,
-#                 'end': end / sr,
-#                 'audio': segment,
-#                 'segment_index': len(all_segments) - 1  # Link back to all_segments
-#             })
-#
-#         current_progress = int((idx / diar_total_iters) * 100)
-#         if current_progress > diar_last_progress:
-#             await progress_send_stream.send({"stage": "diarization", "progress": current_progress})
-#             await asyncio.sleep(0.05)
-#             diar_last_progress = current_progress
-#     await progress_send_stream.send({"stage": "diarization", "progress": 100})
-#     await asyncio.sleep(0.1)
-#     return all_segments, embeddings
-
-
 def save_transcript(transcript, output_file):
     """Save the transcript to a file"""
     with open(output_file, 'w', encoding='utf-8') as f:
@@ -466,18 +382,6 @@ def produce_transcript(transcript) -> str:
         f.write(f"{entry['text']}\n\n")
     return f.getvalue()
 
-# Example usage
-if __name__ == "__main__":
-    audio_file = "example.mp3"
-    output_file = "transcript.txt"
-    
-    print("Processing audio file...")
-    transcript = process_audio(
-        audio_file,
-        min_segment_length=1.0
-    )
-    save_transcript(transcript, output_file)
-    print(f"Transcript saved to {output_file}")
 
 def generate_from_prompt(prompt: str, model: Qwen2ForCausalLM, tokenizer: Qwen2TokenizerFast) -> str:
     test_encoding = tokenizer(prompt, return_tensors="pt")
