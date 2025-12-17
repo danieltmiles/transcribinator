@@ -1,4 +1,7 @@
 import os
+import sys
+import json
+import ssl
 from dataclasses import dataclass
 from typing import Optional
 
@@ -88,3 +91,61 @@ def normalize_audio(audio_file_path: str) -> tuple[Tensor, int]:
         signal = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)(signal)
         sr = 16000
     return signal, sr
+
+
+def load_config(config_file):
+    """Load configuration from JSON file.
+    
+    Expected JSON format:
+    {
+        "work_queue": "queue_name",
+        "host": "localhost",
+        "port": 5672,
+        "username": "guest",
+        "password": "guest"
+    }
+    """
+    try:
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+        
+        # Validate required fields
+        required_fields = ['work_queue', 'host', 'port', 'username', 'password']
+        missing_fields = [field for field in required_fields if field not in config]
+        
+        if missing_fields:
+            raise ValueError(f"Missing required fields in config file: {', '.join(missing_fields)}")
+        
+        # Ensure port is an integer
+        config['port'] = int(config['port'])
+        
+        return config
+    except FileNotFoundError:
+        print(f"Error: Configuration file '{config_file}' not found.")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in configuration file: {e}")
+        sys.exit(1)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error loading configuration: {e}")
+        sys.exit(1)
+
+
+def create_ssl_context(cert_file='server_certificate.pem', verify=True):
+    """Create SSL context for RabbitMQ connections.
+    
+    Args:
+        cert_file: Path to the certificate file
+        verify: Whether to verify certificates (set to False for self-signed)
+    
+    Returns:
+        ssl.SSLContext configured for RabbitMQ
+    """
+    ssl_context = ssl.create_default_context(cafile=cert_file)
+    if not verify:
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+    return ssl_context
