@@ -1,11 +1,24 @@
 import asyncio
 import json
 import os
+import ssl
 import time
+import pickle
+import base64
+import uuid
+import hashlib
+from contextlib import contextmanager
 from io import StringIO
 from queue import Queue
+from typing import Any
 
+import pika
 import torch
+from numpy import ndarray
+from pika.adapters.blocking_connection import BlockingChannel
+
+from shared_disks import WebDavRemoteStorage
+
 if torch.cuda.is_available():
     _original_load = torch.load
     torch.load = lambda *args, **kwargs: _original_load(*args, **{**kwargs, 'weights_only': False})
@@ -191,6 +204,149 @@ def format_timestamp(seconds):
     remaining_seconds = remaining_seconds % one_minute
     return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
 
+
+def send_whisper_job_to_queue(job_id: str, audio_segment: ndarray, channel: BlockingChannel):
+    # result = whisper_model.transcribe(
+    #     segment['audio'],
+    #     temperature=0.2,  # Low temperature. Conservative, but small creative freedom
+    #     language='en',  # Explicitly specify English
+    #     # initial_prompt="Um, uh, and other hesitation sounds should be transcribed as such.",
+    #     word_timestamps=True,
+    # )
+    work_queue = "whisper/large"
+    response_queue = f"{work_queue}-{uuid.uuid4()}"
+    job_message = {
+        'job_id': job_id,
+        'reply_to': response_queue,
+        'audio_segment': audio_segment.tolist(),
+        'temperature': 0.2,
+        'language': 'en',
+        # 'initial_prompt': 'Um, uh, and other hesitation sounds should be transcribed as such.',
+        'word_timestamps': True,
+    }
+
+@contextmanager
+def rabbitmq_channel(rabbitmq_config: dict[str, Any]) -> BlockingChannel:
+    """
+    Context manager for RabbitMQ connection that yields a channel.
+    Ensures the connection is properly closed when the context exits.
+    
+    Args:
+        rabbitmq_config: Dictionary containing RabbitMQ connection configuration
+                        (host, port, username, password)
+    
+    Yields:
+        pika.channel.Channel: An open channel for RabbitMQ operations
+    """
+    ssl_context = ssl.create_default_context(cafile='server_certificate.pem')
+    connection = pika.BlockingConnection(
+        pika.ConnectionParameters(
+            host=rabbitmq_config['host'],
+            port=rabbitmq_config['port'],
+            credentials=pika.PlainCredentials(rabbitmq_config['username'], rabbitmq_config['password']),
+            ssl_options=pika.SSLOptions(ssl_context)
+        )
+    )
+    try:
+        channel = connection.channel()
+        yield channel
+    finally:
+        connection.close()
+
+
+def send_diarization_job_to_queue(audio_file_path: str, rabbitmq_config: dict[str, Any]) -> None | DiarizeOutput:
+    # Generate unique job ID
+    job_id = str(uuid.uuid4())
+    # TODO: make this robust against weird filenames
+    file_extension = audio_file_path.split(".")[-1]
+    remote_file_path = f"{job_id}.{file_extension}"
+
+    # Calculate SHA256 checksum of the audio file
+    sha256_hash = hashlib.sha256()
+    with open(audio_file_path, "rb") as f:
+        # Read file in chunks to handle large files efficiently
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    audio_file_sha256 = sha256_hash.hexdigest()
+
+    webdav_remote_storage = WebDavRemoteStorage("https://webdav.doodledome.org", "dmiles", "secret123")
+    print("uploading file to shared storage")
+    webdav_remote_storage.send(audio_file_path, remote_file_path)
+    print("finished uploading file to shared storage")
+
+    work_queue = "pyannote/speaker-diarization-community-1"
+    response_queue = f"{work_queue}-{uuid.uuid4()}"
+
+
+    # Serialize waveform
+    # Create job message
+    job_message = {
+        'job_id': job_id,
+        'remote_file_type': "webdav",
+        "remote_file_info": {
+            "server": "https://webdav.doodledome.org",
+            "filename": remote_file_path,
+        },
+        'reply_to': response_queue,
+        'sha256sum': audio_file_sha256,
+    }
+    
+    # Wait for response
+    result = None | DiarizeOutput
+    
+    def on_response(ch, method, properties, body):
+        nonlocal result
+        try:
+            response = json.loads(body)
+            if response.get('job_id') == job_id:
+                if response.get('status') == 'success':
+                    # Deserialize diarization result
+                    diarization_encoded = response.get('diarization')
+                    diarization_bytes = base64.b64decode(diarization_encoded)
+                    result = pickle.loads(diarization_bytes)
+                    print(f"Received diarization result for job {job_id}")
+                else:
+                    error = response.get('error', 'Unknown error')
+                    raise RuntimeError(f"Diarization job failed: {error}")
+                
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+                ch.stop_consuming()
+        except Exception as e:
+            print(f"Error processing response: {e}")
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            raise
+    
+    # Use context manager for RabbitMQ connection
+    with rabbitmq_channel(rabbitmq_config) as channel:
+        # Declare queues
+        channel.queue_declare(queue=work_queue, durable=True)
+        channel.queue_declare(queue=response_queue, durable=True)
+        
+        # Send job to work queue
+        channel.basic_publish(
+            exchange='',
+            routing_key=work_queue,
+            body=json.dumps(job_message),
+            properties=pika.BasicProperties(
+                delivery_mode=2,  # Make message persistent
+                reply_to=response_queue,
+            )
+        )
+        
+        print(f"Sent diarization job {job_id} to queue {work_queue}")
+        
+        # Consume from response queue
+        channel.basic_consume(queue=response_queue, on_message_callback=on_response)
+        
+        print(f"Waiting for diarization result for job {job_id}...")
+        channel.start_consuming()
+    
+    if result is None:
+        raise RuntimeError("Failed to receive diarization result")
+    
+    return result
+
+
 async def process_audio(audio_file_path: str, min_segment_length: float, progress_send_stream: MemoryObjectSendStream[dict], transcript_send_stream: MemoryObjectSendStream[str]):
     """
     Process audio file for speaker identification and transcription
@@ -199,90 +355,97 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
     - audio_file_path: Path to the audio file
     - min_segment_length: Minimum segment length in seconds
     """
-    signal, sr = await normalize_audio(audio_file_path)
+    # Send diarization job to RabbitMQ queue
+    # Check if RabbitMQ config is available (optional feature)
+    with open("rabbitmq_config.json", "r") as fl:
+        rabbitmq_config = json.load(fl)
+    print("Using RabbitMQ for diarization...")
+    await progress_send_stream.send({"stage": "diarization", "progress": 0})
 
-    start = time.time()
-    print("Loading models...")
-    try:
-        whisper_model = ModelHaver.instance().whisper_model
-    except AttributeError:
-        raise ImportError(
-            "Error loading Whisper model. Please ensure you have openai-whisper installed, not whisper"
-        )
-    pipeline = Pipeline.from_pretrained(
-        checkpoint="pyannote/speaker-diarization-community-1",
-        token=load_hf_token(),
-    ).to(torch.device(device))
-
-    end = time.time()
-    await asyncio.sleep(0.1)
-    print(f"loaded models in {end - start} seconds")
-
-    # Ensure waveform is 2D (channel, time) as required by pyannote
-    waveform = signal
-    if signal.dim() == 1:
-        waveform = signal.unsqueeze(0)
-
-    with TqdmProgressHook(progress_send_stream, "embeddings") as hook:
-        diarization: DiarizeOutput = pipeline({"waveform": waveform, "sample_rate": sr}, hook=hook)
-        # Flush all queued progress updates to the websocket
-        await hook.flush_progress()
+    # Run RabbitMQ communication in executor to avoid blocking async loop
+    loop = asyncio.get_event_loop()
+    diarization = await loop.run_in_executor(
+        None,
+        send_diarization_job_to_queue,
+        audio_file_path,
+        rabbitmq_config,
+    )
+    await progress_send_stream.send({"stage": "diarization", "progress": 100})
 
     # Create list of segments for total count
+    signal, sr = normalize_audio(audio_file_path)
     segments_list = list(diarized_segment_iter(signal, diarization, sr))
     await progress_send_stream.send({"stage": "transcription", "progress": 0})
     last_progress = 0
     await asyncio.sleep(0.1)
     results = []
     raw_segments = []
-    for i, segment in tqdm.tqdm(enumerate(segments_list)):
-        current_progress = int((i / len(segments_list)) * 100)
-        if current_progress > last_progress:
-            await progress_send_stream.send({"stage": "transcription", "progress": current_progress})
-            await asyncio.sleep(0.1)
-            last_progress = current_progress
-        
-        # Assign speaker based on temporal overlap with diarization segments
-        speaker = assign_speaker_to_segment(diarization, segment['start'], segment['end'])
-
-        if i % 10 == 0:
-            await asyncio.sleep(0.1)
-        result = whisper_model.transcribe(
-            segment['audio'],
-            temperature=0.2,  # Low temperature. Conservative, but small creative freedom
-            language='en',      # Explicitly specify English
-            # initial_prompt="Um, uh, and other hesitation sounds should be transcribed as such.",
-            word_timestamps=True,
-        )
-        text = ""
-        for segment_segment in result.get("segments", []):
-            segment_words = segment_segment.get("words", [])
-            for j, word in enumerate(segment_words):
-                word_word = word.get("word", "")
-                probability = word.get("probability", 0.0)
-                word_duration = word["end"] - word["start"]
-                if word_duration < 0.1:
-                    continue
-                # if this is the first or last word in the segment and it is unusually
-                # short, there is a chance it has been cut off in the middle and we
-                # should allow our overlapping to pick it up in its entirity in a different
-                # segment.
-                if word_duration < 0.25 and (j == 0 or j == len(segment_words) - 1):
-                    probability *= 0.5
-                if probability > 0.3:
-                    text += word_word
-        text = text.strip()
-
-        # os.remove(temp_file)
-        
-        if text:  # Only add segments with text
-            raw_segments.append({
-                'speaker': speaker,
-                'start': segment['start'],
-                'end': segment['end'],
-                'text': text
-            })
-            results.append(result)
+    work_queue = "whisper/large"
+    response_queue = f"{work_queue}-{uuid.uuid4()}"
+    job_id = str(uuid.uuid4())
+    with rabbitmq_channel(rabbitmq_config) as channel:
+        channel.queue_declare(queue=work_queue, durable=True)
+        channel.queue_declare(queue=response_queue, durable=True)
+        for i, segment in tqdm.tqdm(enumerate(segments_list)):
+            # current_progress = int((i / len(segments_list)) * 100)
+            # if current_progress > last_progress:
+            #     await progress_send_stream.send({"stage": "transcription", "progress": current_progress})
+            #     await asyncio.sleep(0.1)
+            #     last_progress = current_progress
+            job_message = {
+                'job_id': job_id,
+                'reply_to': response_queue,
+                'audio_segment': {
+                    'audio': segment['audio'].tolist(),
+                    'start': segment["start"],
+                    "end": segment["end"],
+                    "speaker": segment["speaker"],
+                },
+                'speaker': assign_speaker_to_segment(diarization, segment['start'], segment['end']),
+                'temperature': 0.2,
+                'language': 'en',
+                # 'initial_prompt': 'Um, uh, and other hesitation sounds should be transcribed as such.',
+                'word_timestamps': True,
+            }
+            # Send job to work queue
+            channel.basic_publish(
+                exchange='',
+                routing_key=work_queue,
+                body=json.dumps(job_message),
+                properties=pika.BasicProperties(
+                    delivery_mode=2,  # Make message persistent
+                    reply_to=response_queue,
+                )
+            )
+            # text = ""
+            # for segment_segment in result.get("segments", []):
+            #     segment_words = segment_segment.get("words", [])
+            #     for j, word in enumerate(segment_words):
+            #         word_word = word.get("word", "")
+            #         probability = word.get("probability", 0.0)
+            #         word_duration = word["end"] - word["start"]
+            #         if word_duration < 0.1:
+            #             continue
+            #         # if this is the first or last word in the segment and it is unusually
+            #         # short, there is a chance it has been cut off in the middle and we
+            #         # should allow our overlapping to pick it up in its entirity in a different
+            #         # segment.
+            #         if word_duration < 0.25 and (j == 0 or j == len(segment_words) - 1):
+            #             probability *= 0.5
+            #         if probability > 0.3:
+            #             text += word_word
+            # text = text.strip()
+            #
+            # # os.remove(temp_file)
+            #
+            # if text:  # Only add segments with text
+            #     raw_segments.append({
+            #         'speaker': speaker,
+            #         'start': segment['start'],
+            #         'end': segment['end'],
+            #         'text': text
+            #     })
+            #     results.append(result)
     with open("results.json", "w") as fl:
         json.dump(results, fl, indent=4)
 

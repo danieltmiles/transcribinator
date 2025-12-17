@@ -32,3 +32,6 @@ matplotlib
 pyannote.audio
 onnxruntime
 msgpack
+pika
+aio-pika
+webdavclient3

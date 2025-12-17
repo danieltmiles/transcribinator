@@ -71,7 +71,7 @@ def assign_speaker_to_segment(diarization, segment_start, segment_end):
     return best_speaker
 
 
-async def normalize_audio(audio_file_path: str) -> tuple[Tensor, int]:
+def normalize_audio(audio_file_path: str) -> tuple[Tensor, int]:
     file_extension = os.path.splitext(audio_file_path)[1].lower()
     if file_extension != ".wav":
         audio = AudioSegment.from_file(audio_file_path)
