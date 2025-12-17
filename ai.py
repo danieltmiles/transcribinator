@@ -346,6 +346,122 @@ def send_diarization_job_to_queue(audio_file_path: str, rabbitmq_config: dict[st
     
     return result
 
+async def send_whisper_jobs(
+    audio_file_path: str,
+    rabbitmq_config: dict[str, Any],
+    diarization: DiarizeOutput,
+) -> None:
+    work_queue = "whisper/large"
+    response_queue = f"{work_queue}-{uuid.uuid4()}"
+    # Create list of segments for total count
+    signal, sr = normalize_audio(audio_file_path)
+    segments_list = list(diarized_segment_iter(signal, diarization, sr))
+    # await progress_send_stream.send({"stage": "transcription", "progress": 0})
+    # await asyncio.sleep(0.1)
+    job_id = str(uuid.uuid4())
+    raw_segments = []
+
+    def on_response(ch, method, properties, body):
+        response = json.loads(body)
+        text = ""
+        for segment in response.get("transcription", {}).get("segments", []):
+            segment_words = segment.get("words", [])
+            for word in segment_words:
+                word_word = word.get("word", "")
+                probability = word.get("probability", 0.0)
+                word_duration = word["end"] - word["start"]
+                if word_duration < 0.1:
+                    continue
+                if probability > 0.3:
+                    text += word_word
+            text = text.strip()
+            if text:  # Only add segments with text
+                raw_segments.append({
+                    'speaker': response.get("speaker"),
+                    'start': segment['start'],
+                    'end': segment['end'],
+                    'text': text
+                })
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            # ch.stop_consuming()
+
+        # {
+        #     "job_id": "eda51e7f-88a7-4e02-a48e-29839621ca88",
+        #     "status": "success",
+        #     "transcription": {
+        #         "text": " We're in.",
+        #         "segments": [
+        #             {
+        #                 "id": 0,
+        #                 "seek": 0,
+        #                 "start": 0.0,
+        #                 "end": 0.18,
+        #                 "text": " We're in.",
+        #                 "tokens": [...],
+        #                 "temperature": 0.2,
+        #                 "avg_logprob": -0.5117206232888358,
+        #                 "compression_ratio": 0.5294117647058824,
+        #                 "no_speech_prob": 0.6342576742172241,
+        #                 "words": [
+        #                     {
+        #                         "word": " We're",
+        #                         "start": 0.0,
+        #                         "end": 0.18,
+        #                         "probability": 0.573191799223423
+        #                     },
+        #                     {
+        #                         "word": " in.",
+        #                         "start": 0.18,
+        #                         "end": 0.18,
+        #                         "probability": 0.9867683053016663
+        #                     }
+        #                 ]
+        #             }
+        #         ],
+        #         "language": "en"
+        #     },
+        #     "speaker": "SPEAKER_00",
+        #     "audio_segment": {
+        #         "start": 0.16596875,
+        #         "end": 0.57096875,
+        #         "speaker": "SPEAKER_00"
+        #     }
+        # }
+    with rabbitmq_channel(rabbitmq_config) as channel:
+        channel.queue_declare(queue=work_queue, durable=True)
+        channel.queue_declare(queue=response_queue, durable=True)
+        # Consume from response queue
+        channel.basic_consume(queue=response_queue, on_message_callback=on_response)
+        total_segments = len(segments_list)
+        for i, segment in tqdm.tqdm(enumerate(segments_list)):
+            job_message = {
+                'job_id': job_id,
+                'reply_to': response_queue,
+                'audio_segment': {
+                    'audio': segment['audio'].tolist(),
+                    'start': segment["start"],
+                    "end": segment["end"],
+                    "speaker": segment["speaker"],
+                },
+                'speaker': assign_speaker_to_segment(diarization, segment['start'], segment['end']),
+                'temperature': 0.2,
+                'language': 'en',
+                # 'initial_prompt': 'Um, uh, and other hesitation sounds should be transcribed as such.',
+                'word_timestamps': True,
+                'segment_count': i,
+                'total_segments': total_segments,
+            }
+            # Send job to work queue
+            channel.basic_publish(
+                exchange='',
+                routing_key=work_queue,
+                body=json.dumps(job_message),
+                properties=pika.BasicProperties(
+                    delivery_mode=2,  # Make message persistent
+                    reply_to=response_queue,
+                )
+            )
+
 
 async def process_audio(audio_file_path: str, min_segment_length: float, progress_send_stream: MemoryObjectSendStream[dict], transcript_send_stream: MemoryObjectSendStream[str]):
     """
@@ -371,83 +487,39 @@ async def process_audio(audio_file_path: str, min_segment_length: float, progres
         rabbitmq_config,
     )
     await progress_send_stream.send({"stage": "diarization", "progress": 100})
-
-    # Create list of segments for total count
-    signal, sr = normalize_audio(audio_file_path)
-    segments_list = list(diarized_segment_iter(signal, diarization, sr))
-    await progress_send_stream.send({"stage": "transcription", "progress": 0})
-    last_progress = 0
-    await asyncio.sleep(0.1)
-    results = []
-    raw_segments = []
-    work_queue = "whisper/large"
-    response_queue = f"{work_queue}-{uuid.uuid4()}"
-    job_id = str(uuid.uuid4())
-    with rabbitmq_channel(rabbitmq_config) as channel:
-        channel.queue_declare(queue=work_queue, durable=True)
-        channel.queue_declare(queue=response_queue, durable=True)
-        for i, segment in tqdm.tqdm(enumerate(segments_list)):
-            # current_progress = int((i / len(segments_list)) * 100)
-            # if current_progress > last_progress:
-            #     await progress_send_stream.send({"stage": "transcription", "progress": current_progress})
-            #     await asyncio.sleep(0.1)
-            #     last_progress = current_progress
-            job_message = {
-                'job_id': job_id,
-                'reply_to': response_queue,
-                'audio_segment': {
-                    'audio': segment['audio'].tolist(),
-                    'start': segment["start"],
-                    "end": segment["end"],
-                    "speaker": segment["speaker"],
-                },
-                'speaker': assign_speaker_to_segment(diarization, segment['start'], segment['end']),
-                'temperature': 0.2,
-                'language': 'en',
-                # 'initial_prompt': 'Um, uh, and other hesitation sounds should be transcribed as such.',
-                'word_timestamps': True,
-            }
-            # Send job to work queue
-            channel.basic_publish(
-                exchange='',
-                routing_key=work_queue,
-                body=json.dumps(job_message),
-                properties=pika.BasicProperties(
-                    delivery_mode=2,  # Make message persistent
-                    reply_to=response_queue,
-                )
-            )
-            # text = ""
-            # for segment_segment in result.get("segments", []):
-            #     segment_words = segment_segment.get("words", [])
-            #     for j, word in enumerate(segment_words):
-            #         word_word = word.get("word", "")
-            #         probability = word.get("probability", 0.0)
-            #         word_duration = word["end"] - word["start"]
-            #         if word_duration < 0.1:
-            #             continue
-            #         # if this is the first or last word in the segment and it is unusually
-            #         # short, there is a chance it has been cut off in the middle and we
-            #         # should allow our overlapping to pick it up in its entirity in a different
-            #         # segment.
-            #         if word_duration < 0.25 and (j == 0 or j == len(segment_words) - 1):
-            #             probability *= 0.5
-            #         if probability > 0.3:
-            #             text += word_word
-            # text = text.strip()
-            #
-            # # os.remove(temp_file)
-            #
-            # if text:  # Only add segments with text
-            #     raw_segments.append({
-            #         'speaker': speaker,
-            #         'start': segment['start'],
-            #         'end': segment['end'],
-            #         'text': text
-            #     })
-            #     results.append(result)
-    with open("results.json", "w") as fl:
-        json.dump(results, fl, indent=4)
+    await send_whisper_jobs(audio_file_path, rabbitmq_config, diarization)
+    #
+    #     text = ""
+    #     for segment_segment in result.get("segments", []):
+    #         segment_words = segment_segment.get("words", [])
+    #         for j, word in enumerate(segment_words):
+    #             word_word = word.get("word", "")
+    #             probability = word.get("probability", 0.0)
+    #             word_duration = word["end"] - word["start"]
+    #             if word_duration < 0.1:
+    #                 continue
+    #             # if this is the first or last word in the segment and it is unusually
+    #             # short, there is a chance it has been cut off in the middle and we
+    #             # should allow our overlapping to pick it up in its entirity in a different
+    #             # segment.
+    #             if word_duration < 0.25 and (j == 0 or j == len(segment_words) - 1):
+    #                 probability *= 0.5
+    #             if probability > 0.3:
+    #                 text += word_word
+    #     text = text.strip()
+    #
+    #     # os.remove(temp_file)
+    #
+    #     if text:  # Only add segments with text
+    #         raw_segments.append({
+    #             'speaker': speaker,
+    #             'start': segment['start'],
+    #             'end': segment['end'],
+    #             'text': text
+    #         })
+    #         results.append(result)
+    # with open("results.json", "w") as fl:
+    #     json.dump(results, fl, indent=4)
 
     # Merge segments from the same speaker and clean overlapping text
     transcript = []

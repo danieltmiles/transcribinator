@@ -12,7 +12,8 @@ from pamqp.commands import Basic
 from utils import load_config, create_ssl_context
 
 # Set device for PyTorch
-device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "cpu")
+# device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def load_whisper_model():
@@ -115,7 +116,9 @@ async def process_message(message: aio_pika.IncomingMessage, whisper_model):
             initial_prompt = body.get('initial_prompt')
             word_timestamps = body.get('word_timestamps', True)
             speaker = body.get('speaker', audio_segment.get('speaker', 'Unknown'))
-            
+            segment_count = body.get("segment_count")
+            total_segments = body.get("total_segments")
+
             print(f"Processing job {job_id} for speaker {speaker}")
             
             # Convert audio data from list back to numpy array
@@ -149,7 +152,9 @@ async def process_message(message: aio_pika.IncomingMessage, whisper_model):
                     'start': audio_segment.get('start'),
                     'end': audio_segment.get('end'),
                     'speaker': audio_segment.get('speaker')
-                }
+                },
+                'segment_count': segment_count,
+                'total_segments': total_segments,
             }
             
             # Get channel from message
