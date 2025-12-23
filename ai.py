@@ -31,7 +31,7 @@ from pyannote.audio.pipelines.speaker_diarization import DiarizeOutput
 from transformers import Qwen2ForCausalLM, Qwen2TokenizerFast, AutoModelForCausalLM, AutoTokenizer
 
 from speaker_counting_parallel import find_optimal_speakers_multi_metric_parallel
-from utils import diarized_segment_iter, assign_speaker_to_segment, normalize_audio
+from utils import diarized_segment_iter, assign_speaker_to_segment, normalize_audio, create_ssl_context
 
 
 def load_hf_token(token_file="hf_token.txt"):
@@ -201,6 +201,49 @@ def format_timestamp(seconds):
     minutes = int(remaining_seconds / one_minute)
     remaining_seconds = remaining_seconds % one_minute
     return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
+
+
+def sliding_window(iterable, n, stride=1):
+    """
+    Create sliding windows of size n with specified stride.
+    
+    Args:
+        iterable: The sequence to create windows from
+        n: Window size (number of items per window)
+        stride: Step size between windows (stride=1 gives overlapping windows,
+                stride=n gives non-overlapping windows)
+    
+    Yields:
+        Tuples of size n (or smaller for the last window if not enough items)
+    
+    Examples:
+        stride=1 gives overlapping windows (1-7, 2-8, 3-9...)
+        stride=3 gives less overlapping windows (1-7, 4-11, 7-14...)
+    """
+    items = list(iterable)
+    for i in range(0, len(items) - n + 1, stride):
+        yield tuple(items[i:i + n])
+
+
+def format_segment_for_speaker_identification(segment: dict[str, Any]) -> str:
+    """
+    Format a transcript segment for speaker identification.
+    
+    Args:
+        segment: A transcript segment with speaker, start, end, and text fields
+    
+    Returns:
+        Formatted string in the format "[HH:MM:SS - HH:MM:SS] Speaker_XX:\ntext"
+    """
+    start = segment.get('start', 0)
+    end = segment.get('end', 0)
+    speaker = segment.get('speaker', 'Unknown')
+    text = segment.get('text', '')
+    
+    start_str = format_timestamp(start)
+    end_str = format_timestamp(end)
+    
+    return f"[{start_str} - {end_str}] {speaker}:\n{text}"
 
 
 async def send_diarization_job_to_queue(audio_file_path: str, rabbitmq_config: dict[str, Any]) -> None | DiarizeOutput:
@@ -487,43 +530,647 @@ async def process_audio(audio_file_path: str, min_segment_length: float, transcr
     """
     Process audio file for speaker identification and transcription.
     
-    After diarization completes, send_whisper_jobs and journalistic_courtesy 
-    run concurrently, with whisper transcription streaming results to cleanup
-    as they arrive.
+    Pipeline stages (running concurrently where possible):
+    1. Diarization - identify speaker segments in audio
+    2. Whisper transcription - transcribe each segment (streams to step 3)
+    3. Journalistic courtesy (LLM cleanup) - clean up transcription errors (streams to step 4)
+    4. Speaker identification - identify speaker names from context clues (runs as windows become ready)
 
     Parameters:
     - audio_file_path: Path to the audio file
     - min_segment_length: Minimum segment length in seconds
+    - transcript_send_stream: Stream for sending final transcript
     """
     with open("rabbitmq_config.json", "r") as fl:
         rabbitmq_config = json.load(fl)
     
     # Step 1: Diarization must complete first
+    print("Step 1: Starting diarization...")
     diarization = await send_diarization_job_to_queue(audio_file_path, rabbitmq_config)
     
-    # Step 2: Run whisper transcription and journalistic courtesy concurrently
-    # Create memory object stream for passing segments from whisper to cleanup
-    segment_send_stream, segment_receive_stream = anyio.create_memory_object_stream[dict[str, Any]](max_buffer_size=100)
+    # Steps 2, 3, & 4 run concurrently with streaming between them
+    # Create memory object streams for the pipeline:
+    # whisper -> cleanup -> speaker_identification -> final transcript
+    print("Steps 2-4: Starting transcription, cleanup, and speaker identification (concurrent)...")
+    
+    # Stream from whisper to cleanup
+    whisper_to_cleanup_send, whisper_to_cleanup_receive = anyio.create_memory_object_stream[dict[str, Any]](max_buffer_size=100)
+    
+    # Stream from cleanup to speaker identification
+    cleanup_to_speaker_id_send, cleanup_to_speaker_id_receive = anyio.create_memory_object_stream[dict[str, Any]](max_buffer_size=100)
     
     async with anyio.create_task_group() as tg:
-        # Start whisper jobs - will stream results to segment_send_stream
+        # Start whisper jobs - streams results to cleanup
         tg.start_soon(
             send_whisper_jobs,
             audio_file_path,
             rabbitmq_config,
             diarization,
-            segment_send_stream
+            whisper_to_cleanup_send
         )
         
-        # Start journalistic courtesy - will consume from segment_receive_stream
+        # Start journalistic courtesy - consumes from whisper, streams to speaker ID
         tg.start_soon(
-            journalistic_courtesy,
-            segment_receive_stream,
-            transcript_send_stream,
+            journalistic_courtesy_streaming,
+            whisper_to_cleanup_receive,
+            cleanup_to_speaker_id_send,
             rabbitmq_config
+        )
+        
+        # Start speaker identification - consumes cleaned segments, produces final transcript
+        tg.start_soon(
+            speaker_identification_streaming,
+            cleanup_to_speaker_id_receive,
+            transcript_send_stream,
+            rabbitmq_config,
+            5,  # window_size
+            2,  # stride
         )
     
     print("Audio processing completed successfully")
+
+
+async def send_speaker_identification_jobs(
+    cleaned_segments: list[dict[str, Any]],
+    rabbitmq_config: dict[str, Any],
+    window_size: int = 5,
+    stride: int = 2,
+) -> dict[str, dict[str, Any]]:
+    """
+    Send speaker identification jobs to RabbitMQ using a sliding window approach.
+    
+    This function takes cleaned transcript segments and sends them to an LLM worker
+    in overlapping windows. The LLM analyzes each window to identify speaker names
+    from context clues, and results are merged by keeping the highest confidence
+    identification for each speaker.
+    
+    Args:
+        cleaned_segments: List of cleaned transcript segments, sorted by segment_count
+        rabbitmq_config: RabbitMQ connection configuration
+        window_size: Number of segments per window (default: 5)
+        stride: Number of segments to move between windows (default: 2)
+        
+    Returns:
+        dict: Speaker tally mapping speaker IDs to their identified names and confidence
+              e.g., {"Speaker_01": {"name": "John Smith", "confidence": 9}, ...}
+    """
+    if not cleaned_segments:
+        return {}
+    
+    work_queue = "llm/speaker-identification"
+    response_queue = f"{work_queue}-{uuid.uuid4()}"
+    job_id = str(uuid.uuid4())
+    
+    # Sort segments by segment_count to ensure proper ordering
+    sorted_segments = sorted(cleaned_segments, key=lambda x: x.get("segment_count", 0))
+    
+    # Calculate total windows
+    total_windows = max(0, (len(sorted_segments) - window_size) // stride + 1)
+    if total_windows == 0 and len(sorted_segments) > 0:
+        total_windows = 1  # At least one window if we have any segments
+    
+    print(f"Speaker identification: Processing {len(sorted_segments)} segments in {total_windows} windows")
+    print(f"  Window size: {window_size}, Stride: {stride}")
+    print(f"Job ID: {job_id}")
+    
+    # Connect to RabbitMQ
+    ssl_context = create_ssl_context()
+    connection = await aio_pika.connect_robust(
+        host=rabbitmq_config['host'],
+        port=rabbitmq_config['port'],
+        login=rabbitmq_config['username'],
+        password=rabbitmq_config['password'],
+        ssl=True,
+        ssl_context=ssl_context,
+    )
+    
+    results = {}
+    received_windows = set()
+    speaker_tally = {}
+    
+    async with connection:
+        channel = await connection.channel()
+        await channel.set_qos(prefetch_count=10)
+        
+        # Declare queues
+        await channel.declare_queue(work_queue, durable=True)
+        response_queue_obj = await channel.declare_queue(response_queue, durable=True)
+        
+        # Send all window jobs
+        window_id = 0
+        for window_segments in sliding_window(sorted_segments, window_size, stride):
+            # Format each segment in the window
+            formatted_segments = [
+                format_segment_for_speaker_identification(seg) 
+                for seg in window_segments
+            ]
+            transcript_window = "\n\n".join(formatted_segments)
+            
+            job_message = {
+                'job_id': job_id,
+                'reply_to': response_queue,
+                'window_id': window_id,
+                'transcript_window': transcript_window,
+                'total_windows': total_windows,
+            }
+            
+            await channel.default_exchange.publish(
+                aio_pika.Message(body=json.dumps(job_message).encode()),
+                routing_key=work_queue,
+            )
+            window_id += 1
+        
+        # Handle edge case: if we have fewer segments than window_size, send one window
+        if window_id == 0 and len(sorted_segments) > 0:
+            formatted_segments = [
+                format_segment_for_speaker_identification(seg) 
+                for seg in sorted_segments
+            ]
+            transcript_window = "\n\n".join(formatted_segments)
+            
+            job_message = {
+                'job_id': job_id,
+                'reply_to': response_queue,
+                'window_id': 0,
+                'transcript_window': transcript_window,
+                'total_windows': 1,
+            }
+            
+            await channel.default_exchange.publish(
+                aio_pika.Message(body=json.dumps(job_message).encode()),
+                routing_key=work_queue,
+            )
+            total_windows = 1
+        
+        print(f"Sent {total_windows} speaker identification windows, waiting for responses...")
+        
+        # Consume responses
+        async with response_queue_obj.iterator() as queue_iter:
+            async for message in queue_iter:
+                async with message.process():
+                    response = json.loads(message.body.decode())
+                    
+                    if response.get("job_id") != job_id:
+                        continue
+                    
+                    window_id = response.get("window_id")
+                    if window_id is None:
+                        print("Bad message: no window_id, skipping")
+                        continue
+                    
+                    print(f"Received speaker identification response for window {window_id}")
+                    received_windows.add(window_id)
+                    
+                    if response.get("status") == "success":
+                        parsed_result = response.get("result", {})
+                        results[window_id] = parsed_result
+                        
+                        # Merge results into speaker_tally with confidence-based replacement
+                        for speaker_id, speaker_info in parsed_result.items():
+                            if isinstance(speaker_info, dict) and 'name' in speaker_info and 'confidence' in speaker_info:
+                                new_confidence = speaker_info['confidence']
+                                new_name = speaker_info['name']
+                                
+                                # Add or update speaker if confidence is higher
+                                if speaker_id not in speaker_tally or new_confidence > speaker_tally[speaker_id]['confidence']:
+                                    speaker_tally[speaker_id] = {
+                                        'name': new_name,
+                                        'confidence': new_confidence
+                                    }
+                                    print(f"  Window {window_id}: Updated {speaker_id} -> {new_name} (confidence: {new_confidence})")
+                    else:
+                        error = response.get("error", "Unknown error")
+                        print(f"  Window {window_id} error: {error}")
+                    
+                    # Stop when all windows received
+                    if len(received_windows) >= total_windows:
+                        print(f"Received all {total_windows} speaker identification responses")
+                        break
+        
+        # Delete the reply-to queue
+        await channel.queue_delete(response_queue)
+    
+    print(f"Speaker identification complete. Identified {len(speaker_tally)} speakers:")
+    for speaker_id, info in sorted(speaker_tally.items()):
+        print(f"  {speaker_id}: {info['name']} (confidence: {info['confidence']})")
+    
+    return speaker_tally
+
+
+def apply_speaker_identifications(
+    cleaned_segments: list[dict[str, Any]],
+    speaker_tally: dict[str, dict[str, Any]],
+    min_confidence: int = 2
+) -> list[dict[str, Any]]:
+    """
+    Apply speaker identifications to transcript segments.
+    
+    Replaces generic speaker labels (e.g., "Speaker_01") with identified names
+    when the confidence meets the minimum threshold.
+    
+    Args:
+        cleaned_segments: List of cleaned transcript segments
+        speaker_tally: Mapping of speaker IDs to names and confidence scores
+        min_confidence: Minimum confidence required to apply identification (default: 2)
+        
+    Returns:
+        List of segments with updated speaker names
+    """
+    updated_segments = []
+    
+    for segment in cleaned_segments:
+        updated_segment = segment.copy()
+        speaker_id = segment.get('speaker', '')
+        
+        if speaker_id in speaker_tally:
+            speaker_info = speaker_tally[speaker_id]
+            confidence = speaker_info.get('confidence', 0)
+            name = speaker_info.get('name', 'Unknown')
+            
+            # Only apply identification if confidence meets threshold and name is not "Unknown"
+            if confidence >= min_confidence and name.lower() != 'unknown':
+                updated_segment['speaker'] = name
+                updated_segment['original_speaker_id'] = speaker_id
+                updated_segment['speaker_confidence'] = confidence
+        
+        updated_segments.append(updated_segment)
+    
+    return updated_segments
+
+
+async def journalistic_courtesy_streaming(
+    segment_stream_receive: anyio.streams.memory.MemoryObjectReceiveStream[dict[str, Any]],
+    cleaned_segment_send_stream: MemoryObjectSendStream[dict[str, Any]],
+    rabbitmq_config: dict[str, Any]
+) -> None:
+    """
+    Clean up transcript using LLM via RabbitMQ worker, streaming cleaned segments as they arrive.
+    
+    Consolidates consecutive segments from the same speaker before sending to cleanup,
+    then streams cleaned segments to the next pipeline stage as responses arrive.
+    
+    Args:
+        segment_stream_receive: Stream to receive raw transcript segments from
+        cleaned_segment_send_stream: Stream for sending cleaned segments to next stage
+        rabbitmq_config: RabbitMQ connection configuration
+    """
+    work_queue = "llm/cleanup"
+    response_queue = f"{work_queue}-{uuid.uuid4()}"
+    job_id = str(uuid.uuid4())
+    
+    # Create stream for consolidated segments
+    consolidated_send, consolidated_receive = anyio.create_memory_object_stream[dict[str, Any]](max_buffer_size=100)
+    
+    async def consolidate_segments_by_speaker():
+        """Consolidate consecutive segments from the same speaker and forward to cleanup."""
+        current_speaker = None
+        accumulated_segment = None
+        segment_count = 0
+        
+        async with segment_stream_receive, consolidated_send:
+            async for segment in segment_stream_receive:
+                speaker = segment.get('speaker')
+                print(f"Received segment for consolidation: {speaker} - {segment.get('text', '')[:50]}...")
+                
+                if current_speaker != speaker:
+                    # Different speaker - send accumulated segment if it exists
+                    if accumulated_segment is not None:
+                        accumulated_segment['segment_count'] = segment_count
+                        await consolidated_send.send(accumulated_segment)
+                        print(f"Sent consolidated segment {segment_count}: {accumulated_segment.get('speaker')}")
+                        segment_count += 1
+                    
+                    # Start new accumulated segment
+                    accumulated_segment = {
+                        'speaker': speaker,
+                        'start': segment.get('start'),
+                        'end': segment.get('end'),
+                        'text': segment.get('text', ''),
+                    }
+                    current_speaker = speaker
+                else:
+                    # Same speaker - merge with current segment
+                    if accumulated_segment is not None:
+                        accumulated_segment['text'] += ' ' + segment.get('text', '')
+                        accumulated_segment['end'] = segment.get('end')
+            
+            # Send the last accumulated segment
+            if accumulated_segment is not None:
+                accumulated_segment['segment_count'] = segment_count
+                await consolidated_send.send(accumulated_segment)
+                print(f"Sent final consolidated segment {segment_count}: {accumulated_segment.get('speaker')}")
+    
+    async def send_to_rabbitmq_and_stream():
+        """Send consolidated segments to RabbitMQ and stream responses to next stage."""
+        received_segments = set()
+        segment_count = 0
+        total_segments = None
+        out_of_order_responses = {}
+        next_segment_to_send = 0
+        
+        # Connect to RabbitMQ
+        ssl_context = create_ssl_context()
+        connection = await aio_pika.connect_robust(
+            host=rabbitmq_config['host'],
+            port=rabbitmq_config['port'],
+            login=rabbitmq_config['username'],
+            password=rabbitmq_config['password'],
+            ssl=True,
+            ssl_context=ssl_context,
+        )
+        
+        async with connection:
+            channel = await connection.channel()
+            await channel.set_qos(prefetch_count=10)
+            
+            # Declare queues
+            await channel.declare_queue(work_queue, durable=True)
+            response_queue_obj = await channel.declare_queue(response_queue, durable=True)
+            
+            async def consume_and_stream_responses():
+                nonlocal total_segments, next_segment_to_send
+                async with response_queue_obj.iterator() as queue_iter:
+                    async for message in queue_iter:
+                        async with message.process():
+                            response = json.loads(message.body.decode())
+                            
+                            if response.get("job_id") != job_id:
+                                continue
+                            
+                            segment_num = response.get("segment_count")
+                            print(f"Received cleanup response for segment {segment_num}")
+                            
+                            if segment_num is None:
+                                continue
+                            
+                            received_segments.add(segment_num)
+                            
+                            if response.get("status") == "success":
+                                segment = response.get("segment")
+                            else:
+                                print(f"Error cleaning segment {segment_num}: {response.get('error')}")
+                                segment = response.get("segment")
+                            
+                            # Handle ordering - buffer out-of-order responses
+                            if segment_num == next_segment_to_send:
+                                # Send this segment
+                                await cleaned_segment_send_stream.send(segment)
+                                next_segment_to_send += 1
+                                
+                                # Send any buffered segments that are now in order
+                                while next_segment_to_send in out_of_order_responses:
+                                    buffered_segment = out_of_order_responses.pop(next_segment_to_send)
+                                    await cleaned_segment_send_stream.send(buffered_segment)
+                                    next_segment_to_send += 1
+                            else:
+                                # Buffer for later
+                                out_of_order_responses[segment_num] = segment
+                            
+                            # Stop when all segments received
+                            if total_segments is not None and len(received_segments) == total_segments:
+                                print(f"Received all {total_segments} cleaned segments")
+                                break
+            
+            # Start response consumer task
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(consume_and_stream_responses)
+                
+                # Send consolidated segments as they arrive
+                async with consolidated_receive:
+                    async for segment in consolidated_receive:
+                        job_message = {
+                            'job_id': job_id,
+                            'reply_to': response_queue,
+                            'segment': {
+                                'speaker': segment.get('speaker'),
+                                'start': segment.get('start'),
+                                'end': segment.get('end'),
+                                'text': segment.get('text'),
+                                'segment_count': segment.get('segment_count'),
+                            },
+                            'segment_count': segment.get('segment_count'),
+                            'total_segments': None,
+                        }
+                        
+                        await channel.default_exchange.publish(
+                            aio_pika.Message(body=json.dumps(job_message).encode()),
+                            routing_key=work_queue,
+                        )
+                        print(f"Sent consolidated segment {segment.get('segment_count')} to cleanup queue")
+                        segment_count += 1
+                
+                # Now we know the total
+                total_segments = segment_count
+                print(f"All {total_segments} consolidated segments sent to cleanup queue")
+            
+            # Delete the reply-to queue
+            await channel.queue_delete(response_queue)
+        
+        # Close the output stream
+        await cleaned_segment_send_stream.aclose()
+    
+    # Run consolidation and RabbitMQ tasks concurrently
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(consolidate_segments_by_speaker)
+        tg.start_soon(send_to_rabbitmq_and_stream)
+
+
+async def speaker_identification_streaming(
+    cleaned_segment_receive_stream: anyio.streams.memory.MemoryObjectReceiveStream[dict[str, Any]],
+    transcript_send_stream: MemoryObjectSendStream[str],
+    rabbitmq_config: dict[str, Any],
+    window_size: int = 5,
+    stride: int = 2,
+) -> None:
+    """
+    Identify speakers from cleaned transcript segments using a streaming sliding window approach.
+    
+    As cleaned segments arrive, they are buffered until a complete window is ready.
+    Windows are sent to RabbitMQ for LLM processing as soon as they're complete.
+    Final transcript is produced after all segments are received and speaker IDs are applied.
+    
+    Args:
+        cleaned_segment_receive_stream: Stream to receive cleaned segments from
+        transcript_send_stream: Stream for sending final transcript
+        rabbitmq_config: RabbitMQ connection configuration
+        window_size: Number of segments per window (default: 5)
+        stride: Number of segments to move between windows (default: 2)
+    """
+    work_queue = "llm/speaker-identification"
+    response_queue = f"{work_queue}-{uuid.uuid4()}"
+    job_id = str(uuid.uuid4())
+    
+    print(f"Speaker identification starting (window_size={window_size}, stride={stride})")
+    print(f"Job ID: {job_id}")
+    
+    # Buffer for segments and results
+    segment_buffer = []
+    all_segments = []
+    windows_sent = 0
+    windows_received = set()
+    speaker_tally = {}
+    stream_closed = False
+    
+    # Connect to RabbitMQ
+    ssl_context = create_ssl_context()
+    connection = await aio_pika.connect_robust(
+        host=rabbitmq_config['host'],
+        port=rabbitmq_config['port'],
+        login=rabbitmq_config['username'],
+        password=rabbitmq_config['password'],
+        ssl=True,
+        ssl_context=ssl_context,
+    )
+    
+    async with connection:
+        channel = await connection.channel()
+        await channel.set_qos(prefetch_count=10)
+        
+        # Declare queues
+        await channel.declare_queue(work_queue, durable=True)
+        response_queue_obj = await channel.declare_queue(response_queue, durable=True)
+        
+        async def send_window_if_ready():
+            """Check if we can send a new window and send it."""
+            nonlocal windows_sent
+            
+            # Calculate which windows we can send based on buffer size
+            # Window N requires segments [N*stride : N*stride + window_size]
+            while True:
+                start_idx = windows_sent * stride
+                end_idx = start_idx + window_size
+                
+                if end_idx > len(segment_buffer):
+                    # Not enough segments for this window yet
+                    break
+                
+                # We have enough segments for this window
+                window_segments = segment_buffer[start_idx:end_idx]
+                
+                # Format the window
+                formatted_segments = [
+                    format_segment_for_speaker_identification(seg) 
+                    for seg in window_segments
+                ]
+                transcript_window = "\n\n".join(formatted_segments)
+                
+                job_message = {
+                    'job_id': job_id,
+                    'reply_to': response_queue,
+                    'window_id': windows_sent,
+                    'transcript_window': transcript_window,
+                    'total_windows': None,  # Don't know total yet
+                }
+                
+                await channel.default_exchange.publish(
+                    aio_pika.Message(body=json.dumps(job_message).encode()),
+                    routing_key=work_queue,
+                )
+                print(f"Sent speaker identification window {windows_sent} (segments {start_idx}-{end_idx-1})")
+                windows_sent += 1
+        
+        async def receive_segments():
+            """Receive cleaned segments and buffer them, sending windows as ready."""
+            nonlocal stream_closed
+            
+            async with cleaned_segment_receive_stream:
+                async for segment in cleaned_segment_receive_stream:
+                    segment_buffer.append(segment)
+                    all_segments.append(segment)
+                    print(f"Received cleaned segment {segment.get('segment_count')} for speaker ID")
+                    
+                    # Try to send any windows that are now ready
+                    await send_window_if_ready()
+            
+            stream_closed = True
+            print(f"Segment stream closed. Total segments: {len(segment_buffer)}")
+            
+            # Send any remaining windows for partial coverage at the end
+            # If we have fewer segments than window_size but haven't sent any windows, send what we have
+            if windows_sent == 0 and len(segment_buffer) > 0:
+                formatted_segments = [
+                    format_segment_for_speaker_identification(seg) 
+                    for seg in segment_buffer
+                ]
+                transcript_window = "\n\n".join(formatted_segments)
+                
+                job_message = {
+                    'job_id': job_id,
+                    'reply_to': response_queue,
+                    'window_id': 0,
+                    'transcript_window': transcript_window,
+                    'total_windows': 1,
+                }
+                
+                await channel.default_exchange.publish(
+                    aio_pika.Message(body=json.dumps(job_message).encode()),
+                    routing_key=work_queue,
+                )
+                print(f"Sent final partial window (all {len(segment_buffer)} segments)")
+        
+        async def consume_responses():
+            """Consume speaker identification responses and merge results."""
+            async with response_queue_obj.iterator() as queue_iter:
+                async for message in queue_iter:
+                    async with message.process():
+                        response = json.loads(message.body.decode())
+                        
+                        if response.get("job_id") != job_id:
+                            continue
+                        
+                        window_id = response.get("window_id")
+                        if window_id is None:
+                            continue
+                        
+                        print(f"Received speaker identification response for window {window_id}")
+                        windows_received.add(window_id)
+                        
+                        if response.get("status") == "success":
+                            parsed_result = response.get("result", {})
+                            
+                            # Merge results with confidence-based replacement
+                            for speaker_id, speaker_info in parsed_result.items():
+                                if isinstance(speaker_info, dict) and 'name' in speaker_info and 'confidence' in speaker_info:
+                                    new_confidence = speaker_info['confidence']
+                                    new_name = speaker_info['name']
+                                    
+                                    if speaker_id not in speaker_tally or new_confidence > speaker_tally[speaker_id]['confidence']:
+                                        speaker_tally[speaker_id] = {
+                                            'name': new_name,
+                                            'confidence': new_confidence
+                                        }
+                                        print(f"  Updated {speaker_id} -> {new_name} (confidence: {new_confidence})")
+                        else:
+                            error = response.get("error", "Unknown error")
+                            print(f"  Window {window_id} error: {error}")
+                        
+                        # Check if we've received all expected windows
+                        # We're done when stream is closed and we've received all sent windows
+                        if stream_closed and len(windows_received) >= windows_sent:
+                            print(f"Received all {len(windows_received)} speaker identification responses")
+                            break
+        
+        # Run segment receiving and response consuming concurrently
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(receive_segments)
+            tg.start_soon(consume_responses)
+        
+        # Delete the reply-to queue
+        await channel.queue_delete(response_queue)
+    
+    # Apply speaker identifications
+    print(f"Speaker identification complete. Identified {len(speaker_tally)} speakers:")
+    for speaker_id, info in sorted(speaker_tally.items()):
+        print(f"  {speaker_id}: {info['name']} (confidence: {info['confidence']})")
+    
+    if speaker_tally:
+        final_segments = apply_speaker_identifications(all_segments, speaker_tally, min_confidence=2)
+    else:
+        final_segments = all_segments
+    
+    # Produce and send final transcript
+    final_transcript = produce_transcript(final_segments)
+    await transcript_send_stream.send(final_transcript)
     await transcript_send_stream.aclose()
 
 
@@ -536,6 +1183,9 @@ async def journalistic_courtesy(
     Clean up transcript using LLM via RabbitMQ worker, sending consolidated segments to RabbitMQ as they arrive.
     
     Consolidates consecutive segments from the same speaker before sending to cleanup.
+    
+    NOTE: This is the legacy version that returns all segments at once. 
+    Use journalistic_courtesy_streaming for concurrent pipeline processing.
     
     Args:
         segment_stream_receive: Stream to receive raw transcript segments from

@@ -75,13 +75,27 @@ def assign_speaker_to_segment(diarization, segment_start, segment_end):
 
 
 def normalize_audio(audio_file_path: str) -> tuple[Tensor, int]:
+    import io
+    import numpy as np
+    
     file_extension = os.path.splitext(audio_file_path)[1].lower()
-    if file_extension != ".wav":
-        audio = AudioSegment.from_file(audio_file_path)
-        audio.export(f"{audio_file_path}_temp.wav", format="wav")
-        audio_file_path = f"{audio_file_path}_temp.wav"
     print(f"Loading audio file {audio_file_path}")
-    signal, sr = torchaudio.load(audio_file_path)
+    
+    if file_extension != ".wav":
+        # Load audio using pydub and convert to in-memory WAV
+        audio = AudioSegment.from_file(audio_file_path)
+        
+        # Export to in-memory bytes buffer as WAV
+        wav_buffer = io.BytesIO()
+        audio.export(wav_buffer, format="wav")
+        wav_buffer.seek(0)
+        
+        # Load from in-memory buffer using torchaudio
+        signal, sr = torchaudio.load(wav_buffer)
+    else:
+        # Directly load WAV files
+        signal, sr = torchaudio.load(audio_file_path)
+    
     if signal.shape[0] > 1:
         signal = torch.mean(signal, dim=0, keepdim=True)
     signal = signal.squeeze()

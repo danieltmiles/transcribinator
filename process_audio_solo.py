@@ -46,7 +46,7 @@ async def main():
     semaphore = anyio.Semaphore(3)
     result_send, result_receive = create_memory_object_stream[str](max_buffer_size=10)
     async with anyio.create_task_group() as tg:
-        for audio_file in audio_files:
+        for audio_file in audio_files[:2]:
             # Start whisper jobs - will stream results to segment_send_stream
             tg.start_soon(
                 limited_worker,
@@ -55,9 +55,9 @@ async def main():
                 audio_file,
                 result_send.clone(),
             )
-        print("closing result_send")
-        await result_send.aclose()
     print("exited task group")
+    print("closing result_send")
+    await result_send.aclose()
     async with result_receive:
         print("waiting for result_receive")
         async for audio_file_path, transcript_text in result_receive:
