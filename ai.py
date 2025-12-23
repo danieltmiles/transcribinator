@@ -12,10 +12,10 @@ from io import StringIO
 from queue import Queue
 from typing import Any
 
-import pika
+import anyio
+import aio_pika
 import torch
 from numpy import ndarray
-from pika.adapters.blocking_connection import BlockingChannel
 
 from shared_disks import WebDavRemoteStorage
 
@@ -63,10 +63,9 @@ def load_hf_token(token_file="hf_token.txt"):
 class TqdmProgressHook:
     """Custom hook using tqdm for progress display"""
 
-    def __init__(self, progress_send_stream: MemoryObjectSendStream[dict], important_step_name: str = None):
+    def __init__(self, important_step_name: str = None):
         self.pbar = None
         self.step_name = None
-        self.progress_send_stream = progress_send_stream
         self.important_step_name = important_step_name
         self.progress_queue = Queue()
 
@@ -111,7 +110,6 @@ class TqdmProgressHook:
         while not self.progress_queue.empty():
             try:
                 progress_data = self.progress_queue.get_nowait()
-                await self.progress_send_stream.send(progress_data)
             except:
                 break
 
@@ -205,56 +203,10 @@ def format_timestamp(seconds):
     return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
 
 
-def send_whisper_job_to_queue(job_id: str, audio_segment: ndarray, channel: BlockingChannel):
-    # result = whisper_model.transcribe(
-    #     segment['audio'],
-    #     temperature=0.2,  # Low temperature. Conservative, but small creative freedom
-    #     language='en',  # Explicitly specify English
-    #     # initial_prompt="Um, uh, and other hesitation sounds should be transcribed as such.",
-    #     word_timestamps=True,
-    # )
-    work_queue = "whisper/large"
-    response_queue = f"{work_queue}-{uuid.uuid4()}"
-    job_message = {
-        'job_id': job_id,
-        'reply_to': response_queue,
-        'audio_segment': audio_segment.tolist(),
-        'temperature': 0.2,
-        'language': 'en',
-        # 'initial_prompt': 'Um, uh, and other hesitation sounds should be transcribed as such.',
-        'word_timestamps': True,
-    }
-
-@contextmanager
-def rabbitmq_channel(rabbitmq_config: dict[str, Any]) -> BlockingChannel:
-    """
-    Context manager for RabbitMQ connection that yields a channel.
-    Ensures the connection is properly closed when the context exits.
+async def send_diarization_job_to_queue(audio_file_path: str, rabbitmq_config: dict[str, Any]) -> None | DiarizeOutput:
+    """Send diarization job to RabbitMQ and wait for result using aio_pika."""
+    from utils import create_ssl_context
     
-    Args:
-        rabbitmq_config: Dictionary containing RabbitMQ connection configuration
-                        (host, port, username, password)
-    
-    Yields:
-        pika.channel.Channel: An open channel for RabbitMQ operations
-    """
-    ssl_context = ssl.create_default_context(cafile='server_certificate.pem')
-    connection = pika.BlockingConnection(
-        pika.ConnectionParameters(
-            host=rabbitmq_config['host'],
-            port=rabbitmq_config['port'],
-            credentials=pika.PlainCredentials(rabbitmq_config['username'], rabbitmq_config['password']),
-            ssl_options=pika.SSLOptions(ssl_context)
-        )
-    )
-    try:
-        channel = connection.channel()
-        yield channel
-    finally:
-        connection.close()
-
-
-def send_diarization_job_to_queue(audio_file_path: str, rabbitmq_config: dict[str, Any]) -> None | DiarizeOutput:
     # Generate unique job ID
     job_id = str(uuid.uuid4())
     # TODO: make this robust against weird filenames
@@ -277,8 +229,6 @@ def send_diarization_job_to_queue(audio_file_path: str, rabbitmq_config: dict[st
     work_queue = "pyannote/speaker-diarization-community-1"
     response_queue = f"{work_queue}-{uuid.uuid4()}"
 
-
-    # Serialize waveform
     # Create job message
     job_message = {
         'job_id': job_id,
@@ -291,55 +241,55 @@ def send_diarization_job_to_queue(audio_file_path: str, rabbitmq_config: dict[st
         'sha256sum': audio_file_sha256,
     }
     
-    # Wait for response
-    result = None | DiarizeOutput
+    # Connect to RabbitMQ
+    ssl_context = create_ssl_context()
+    connection = await aio_pika.connect_robust(
+        host=rabbitmq_config['host'],
+        port=rabbitmq_config['port'],
+        login=rabbitmq_config['username'],
+        password=rabbitmq_config['password'],
+        ssl=True,
+        ssl_context=ssl_context,
+    )
     
-    def on_response(ch, method, properties, body):
-        nonlocal result
-        try:
-            response = json.loads(body)
-            if response.get('job_id') == job_id:
-                if response.get('status') == 'success':
-                    # Deserialize diarization result
-                    diarization_encoded = response.get('diarization')
-                    diarization_bytes = base64.b64decode(diarization_encoded)
-                    result = pickle.loads(diarization_bytes)
-                    print(f"Received diarization result for job {job_id}")
-                else:
-                    error = response.get('error', 'Unknown error')
-                    raise RuntimeError(f"Diarization job failed: {error}")
-                
-                ch.basic_ack(delivery_tag=method.delivery_tag)
-                ch.stop_consuming()
-        except Exception as e:
-            print(f"Error processing response: {e}")
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-            raise
+    result = None
     
-    # Use context manager for RabbitMQ connection
-    with rabbitmq_channel(rabbitmq_config) as channel:
+    async with connection:
+        channel = await connection.channel()
+        
         # Declare queues
-        channel.queue_declare(queue=work_queue, durable=True)
-        channel.queue_declare(queue=response_queue, durable=True)
+        work_queue_obj = await channel.declare_queue(work_queue, durable=True)
+        response_queue_obj = await channel.declare_queue(response_queue, durable=True)
         
         # Send job to work queue
-        channel.basic_publish(
-            exchange='',
+        await channel.default_exchange.publish(
+            aio_pika.Message(body=json.dumps(job_message).encode()),
             routing_key=work_queue,
-            body=json.dumps(job_message),
-            properties=pika.BasicProperties(
-                delivery_mode=2,  # Make message persistent
-                reply_to=response_queue,
-            )
         )
         
         print(f"Sent diarization job {job_id} to queue {work_queue}")
-        
-        # Consume from response queue
-        channel.basic_consume(queue=response_queue, on_message_callback=on_response)
-        
         print(f"Waiting for diarization result for job {job_id}...")
-        channel.start_consuming()
+        
+        # Wait for response
+        async with response_queue_obj.iterator() as queue_iter:
+            async for message in queue_iter:
+                async with message.process():
+                    response = json.loads(message.body.decode())
+                    
+                    if response.get('job_id') == job_id:
+                        if response.get('status') == 'success':
+                            # Deserialize diarization result
+                            diarization_encoded = response.get('diarization')
+                            diarization_bytes = base64.b64decode(diarization_encoded)
+                            result = pickle.loads(diarization_bytes)
+                            print(f"Received diarization result for job {job_id}")
+                        else:
+                            error = response.get('error', 'Unknown error')
+                            raise RuntimeError(f"Diarization job failed: {error}")
+                        break
+        
+        # Delete the reply-to queue now that we're done consuming
+        await channel.queue_delete(response_queue)
     
     if result is None:
         raise RuntimeError("Failed to receive diarization result")
@@ -350,90 +300,52 @@ async def send_whisper_jobs(
     audio_file_path: str,
     rabbitmq_config: dict[str, Any],
     diarization: DiarizeOutput,
+    segment_stream_send: anyio.streams.memory.MemoryObjectSendStream[dict[str, Any]],
 ) -> None:
+    """
+    Send whisper jobs and stream results as they arrive via memory object stream.
+    
+    Args:
+        audio_file_path: Path to audio file
+        rabbitmq_config: RabbitMQ configuration
+        diarization: Diarization output
+        segment_stream_send: Stream to send completed segments to
+    """
+    from utils import create_ssl_context
+    
     work_queue = "whisper/large"
     response_queue = f"{work_queue}-{uuid.uuid4()}"
-    # Create list of segments for total count
     signal, sr = normalize_audio(audio_file_path)
     segments_list = list(diarized_segment_iter(signal, diarization, sr))
-    # await progress_send_stream.send({"stage": "transcription", "progress": 0})
-    # await asyncio.sleep(0.1)
     job_id = str(uuid.uuid4())
-    raw_segments = []
+    received_segments = []
+    total_segments = len(segments_list)
+    out_of_order_responses = []
 
-    def on_response(ch, method, properties, body):
-        response = json.loads(body)
-        text = ""
-        for segment in response.get("transcription", {}).get("segments", []):
-            segment_words = segment.get("words", [])
-            for word in segment_words:
-                word_word = word.get("word", "")
-                probability = word.get("probability", 0.0)
-                word_duration = word["end"] - word["start"]
-                if word_duration < 0.1:
-                    continue
-                if probability > 0.3:
-                    text += word_word
-            text = text.strip()
-            if text:  # Only add segments with text
-                raw_segments.append({
-                    'speaker': response.get("speaker"),
-                    'start': segment['start'],
-                    'end': segment['end'],
-                    'text': text
-                })
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-            # ch.stop_consuming()
-
-        # {
-        #     "job_id": "eda51e7f-88a7-4e02-a48e-29839621ca88",
-        #     "status": "success",
-        #     "transcription": {
-        #         "text": " We're in.",
-        #         "segments": [
-        #             {
-        #                 "id": 0,
-        #                 "seek": 0,
-        #                 "start": 0.0,
-        #                 "end": 0.18,
-        #                 "text": " We're in.",
-        #                 "tokens": [...],
-        #                 "temperature": 0.2,
-        #                 "avg_logprob": -0.5117206232888358,
-        #                 "compression_ratio": 0.5294117647058824,
-        #                 "no_speech_prob": 0.6342576742172241,
-        #                 "words": [
-        #                     {
-        #                         "word": " We're",
-        #                         "start": 0.0,
-        #                         "end": 0.18,
-        #                         "probability": 0.573191799223423
-        #                     },
-        #                     {
-        #                         "word": " in.",
-        #                         "start": 0.18,
-        #                         "end": 0.18,
-        #                         "probability": 0.9867683053016663
-        #                     }
-        #                 ]
-        #             }
-        #         ],
-        #         "language": "en"
-        #     },
-        #     "speaker": "SPEAKER_00",
-        #     "audio_segment": {
-        #         "start": 0.16596875,
-        #         "end": 0.57096875,
-        #         "speaker": "SPEAKER_00"
-        #     }
-        # }
-    with rabbitmq_channel(rabbitmq_config) as channel:
-        channel.queue_declare(queue=work_queue, durable=True)
-        channel.queue_declare(queue=response_queue, durable=True)
-        # Consume from response queue
-        channel.basic_consume(queue=response_queue, on_message_callback=on_response)
-        total_segments = len(segments_list)
-        for i, segment in tqdm.tqdm(enumerate(segments_list)):
+    current_speaker = None
+    accumulated_segment = None
+    
+    # Connect to RabbitMQ
+    ssl_context = create_ssl_context()
+    connection = await aio_pika.connect_robust(
+        host=rabbitmq_config['host'],
+        port=rabbitmq_config['port'],
+        login=rabbitmq_config['username'],
+        password=rabbitmq_config['password'],
+        ssl=True,
+        ssl_context=ssl_context,
+    )
+    
+    async with connection:
+        channel = await connection.channel()
+        await channel.set_qos(prefetch_count=1)
+        
+        # Declare queues
+        work_queue_obj = await channel.declare_queue(work_queue, durable=True)
+        response_queue_obj = await channel.declare_queue(response_queue, durable=True)
+        
+        # Send all jobs first
+        for i, segment in enumerate(segments_list):
             job_message = {
                 'job_id': job_id,
                 'reply_to': response_queue,
@@ -446,159 +358,356 @@ async def send_whisper_jobs(
                 'speaker': assign_speaker_to_segment(diarization, segment['start'], segment['end']),
                 'temperature': 0.2,
                 'language': 'en',
-                # 'initial_prompt': 'Um, uh, and other hesitation sounds should be transcribed as such.',
                 'word_timestamps': True,
                 'segment_count': i,
                 'total_segments': total_segments,
             }
-            # Send job to work queue
-            channel.basic_publish(
-                exchange='',
+            await channel.default_exchange.publish(
+                aio_pika.Message(body=json.dumps(job_message).encode()),
                 routing_key=work_queue,
-                body=json.dumps(job_message),
-                properties=pika.BasicProperties(
-                    delivery_mode=2,  # Make message persistent
-                    reply_to=response_queue,
-                )
             )
+        
+        print(f"Sent {total_segments} whisper jobs, waiting for responses...")
+        
+        # Now consume responses
+        async with response_queue_obj.iterator() as queue_iter:
+            async for message in queue_iter:
+                async with message.process():
+                    response = json.loads(message.body.decode())
+                    
+                    if response.get("job_id") != job_id:
+                        continue
+                        # TODO: nack
+                    
+                    segment_count = response.get("segment_count")
+                    if segment_count is None:
+                        print("bad message, no segment count, refusing to process")
+                        continue
+                    print(f"Received segment {segment_count}")
+                    
+                    # Track this segment
+                    if len(received_segments) == 0 or segment_count == received_segments[-1] + 1:
+                        received_segments.append(segment_count)
+                    else:
+                        out_of_order_responses.append(response)
+                        continue
+
+                    accumulated_segment, current_speaker = await process_segment(
+                        accumulated_segment,
+                        current_speaker,
+                        response,
+                        segment_count,
+                        segment_stream_send,
+                    )
+
+                    # reconcile any out-of-order segments
+                    out_of_order_responses = sorted(out_of_order_responses,
+                                                   key=lambda x: x["segment_count"])
+                    unreconciled_out_of_order_segments = []
+                    for out_of_order_response in out_of_order_responses:
+                        out_of_order_segment_number = out_of_order_response["segment_count"]
+                        if out_of_order_segment_number == received_segments[-1] + 1:
+                            received_segments.append(out_of_order_segment_number)
+                            accumulated_segment, current_speaker = await process_segment(
+                                accumulated_segment,
+                                current_speaker,
+                                out_of_order_response,
+                                out_of_order_segment_number,
+                                segment_stream_send,
+                            )
+                        else:
+                            unreconciled_out_of_order_segments.append(out_of_order_response)
+                    out_of_order_responses = unreconciled_out_of_order_segments
+
+                    # Stop when all segments received
+                    if len(received_segments) == total_segments:
+                        print(f"Received all {total_segments} segments")
+                        # send the last accumulated segment
+                        if accumulated_segment is not None:
+                            await segment_stream_send.send(accumulated_segment)
+                        await segment_stream_send.aclose()
+                        break
+        
+        # Delete the reply-to queue now that we're done consuming
+        await channel.queue_delete(response_queue)
+
+    print("Finished streaming all whisper segments")
 
 
-async def process_audio(audio_file_path: str, min_segment_length: float, progress_send_stream: MemoryObjectSendStream[dict], transcript_send_stream: MemoryObjectSendStream[str]):
+async def process_segment(
+    accumulated_segment: dict[str, Any] | None,
+    current_speaker: str | None,
+    response: dict[str, Any],
+    segment_count: int,
+    segment_stream_send: MemoryObjectSendStream,
+) -> tuple[dict[str, Any], str]:
+    speaker = response["speaker"]
+    text = get_text_from_segment(response)
+
+    if current_speaker != speaker:
+        # Send accumulated segment if exists
+        if accumulated_segment is not None:
+            await segment_stream_send.send(accumulated_segment)
+
+        # Start new accumulated segment
+        accumulated_segment = {
+            'speaker': speaker,
+            'start': response.get("audio_segment", {}).get("start", -1.0),
+            'end': response.get("audio_segment", {}).get("end", -1.0),
+            'text': text,
+            'segment_count': segment_count,
+            'subsegment_numbers': [response.get("segment_count")],
+        }
+        current_speaker = speaker
+    else:
+        # Merge with current segment
+        if accumulated_segment is not None:
+            accumulated_segment["text"] += text
+            accumulated_segment["end"] = response.get("audio_segment", {}).get("end", -1.0)
+            accumulated_segment["subsegment_numbers"] += [response.get("segment_count")]
+    return accumulated_segment, current_speaker
+
+
+def get_text_from_segment(response) -> str:
+    text = ""
+    for segment in response.get("transcription", {}).get("segments", []):
+        segment_words = segment.get("words", [])
+        for word in segment_words:
+            word_word = word.get("word", "")
+            probability = word.get("probability", 0.0)
+            word_duration = word["end"] - word["start"]
+            if word_duration < 0.1:
+                continue
+            if probability > 0.3:
+                text += word_word
+    return text
+
+
+async def process_audio(audio_file_path: str, min_segment_length: float, transcript_send_stream: MemoryObjectSendStream[str]):
     """
-    Process audio file for speaker identification and transcription
+    Process audio file for speaker identification and transcription.
+    
+    After diarization completes, send_whisper_jobs and journalistic_courtesy 
+    run concurrently, with whisper transcription streaming results to cleanup
+    as they arrive.
 
     Parameters:
     - audio_file_path: Path to the audio file
     - min_segment_length: Minimum segment length in seconds
     """
-    # Send diarization job to RabbitMQ queue
-    # Check if RabbitMQ config is available (optional feature)
     with open("rabbitmq_config.json", "r") as fl:
         rabbitmq_config = json.load(fl)
-    print("Using RabbitMQ for diarization...")
-    await progress_send_stream.send({"stage": "diarization", "progress": 0})
-
-    # Run RabbitMQ communication in executor to avoid blocking async loop
-    loop = asyncio.get_event_loop()
-    diarization = await loop.run_in_executor(
-        None,
-        send_diarization_job_to_queue,
-        audio_file_path,
-        rabbitmq_config,
-    )
-    await progress_send_stream.send({"stage": "diarization", "progress": 100})
-    await send_whisper_jobs(audio_file_path, rabbitmq_config, diarization)
-    #
-    #     text = ""
-    #     for segment_segment in result.get("segments", []):
-    #         segment_words = segment_segment.get("words", [])
-    #         for j, word in enumerate(segment_words):
-    #             word_word = word.get("word", "")
-    #             probability = word.get("probability", 0.0)
-    #             word_duration = word["end"] - word["start"]
-    #             if word_duration < 0.1:
-    #                 continue
-    #             # if this is the first or last word in the segment and it is unusually
-    #             # short, there is a chance it has been cut off in the middle and we
-    #             # should allow our overlapping to pick it up in its entirity in a different
-    #             # segment.
-    #             if word_duration < 0.25 and (j == 0 or j == len(segment_words) - 1):
-    #                 probability *= 0.5
-    #             if probability > 0.3:
-    #                 text += word_word
-    #     text = text.strip()
-    #
-    #     # os.remove(temp_file)
-    #
-    #     if text:  # Only add segments with text
-    #         raw_segments.append({
-    #             'speaker': speaker,
-    #             'start': segment['start'],
-    #             'end': segment['end'],
-    #             'text': text
-    #         })
-    #         results.append(result)
-    # with open("results.json", "w") as fl:
-    #     json.dump(results, fl, indent=4)
-
-    # Merge segments from the same speaker and clean overlapping text
-    transcript = []
-    current_speaker = None
-    current_texts = []
-    current_start = None
-
     
-    for segment in raw_segments:
-        if segment['speaker'] != current_speaker:
-            if current_speaker and current_texts:
-                # cleaned_texts = clean_overlapping_text(current_texts)
-                cleaned_texts = current_texts
-                if cleaned_texts:
-                    transcript.append({
-                        'speaker': current_speaker,
-                        'start': format_timestamp(current_start),
-                        'end': format_timestamp(segment['start']),
-                        'text': ' '.join(cleaned_texts)
-                    })
-            current_speaker = segment['speaker']
-            current_texts = [segment['text']]
-            current_start = segment['start']
-        else:
-            current_texts.append(segment['text'])
-
-    # Add final segment
-    if current_texts:
-        cleaned_texts = clean_overlapping_text(current_texts)
-        if cleaned_texts:
-            transcript.append({
-                'speaker': current_speaker,
-                'start': format_timestamp(current_start),
-                'end': format_timestamp(raw_segments[-1]['end']),
-                'text': " ".join(cleaned_texts)
-            })
-
-    del whisper_model
-    del ModelHaver._instance
-    ModelHaver._instance = None
-    model_name = "Qwen/Qwen2.5-7B-Instruct"
-    # model_name = "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int8"
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float16,  # Force FP16
-        # device_map="cuda:0",  # Explicitly map to GPU if you have one
-        device_map="auto",
-        trust_remote_code=True,
-        max_memory={0: "22GiB"},  # Reserve a bit less than total VRAM
-        # low_cpu_mem_usage=True,
-    )
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
-        trust_remote_code=True
-    )
-    await progress_send_stream.send({"stage": "transcription", "progress": 100})
-
-    await progress_send_stream.send({"stage": "cleanup", "progress": 0})
-    for i, segment in tqdm.tqdm(enumerate(transcript)):
-        current_progress = int((i / max(1, len(transcript))) * 100)
-        await progress_send_stream.send({"stage": "cleanup", "progress": current_progress})
-        cleaned_segment_text = llm_clean(segment["text"], model, tokenizer)
-        transcript[i]["text"] = cleaned_segment_text
+    # Step 1: Diarization must complete first
+    diarization = await send_diarization_job_to_queue(audio_file_path, rabbitmq_config)
     
-    # Clean up temp directory
-    # os.rmdir(temp_dir)
+    # Step 2: Run whisper transcription and journalistic courtesy concurrently
+    # Create memory object stream for passing segments from whisper to cleanup
+    segment_send_stream, segment_receive_stream = anyio.create_memory_object_stream[dict[str, Any]](max_buffer_size=100)
+    
+    async with anyio.create_task_group() as tg:
+        # Start whisper jobs - will stream results to segment_send_stream
+        tg.start_soon(
+            send_whisper_jobs,
+            audio_file_path,
+            rabbitmq_config,
+            diarization,
+            segment_send_stream
+        )
+        
+        # Start journalistic courtesy - will consume from segment_receive_stream
+        tg.start_soon(
+            journalistic_courtesy,
+            segment_receive_stream,
+            transcript_send_stream,
+            rabbitmq_config
+        )
+    
+    print("Audio processing completed successfully")
+    await transcript_send_stream.aclose()
 
-    await progress_send_stream.send({"stage": "cleanup", "progress": 100})
-    await transcript_send_stream.send(produce_transcript(transcript))
-    LOGGER.info(f"{transcript}")
+
+async def journalistic_courtesy(
+    segment_stream_receive: anyio.streams.memory.MemoryObjectReceiveStream[dict[str, Any]],
+    transcript_send_stream: MemoryObjectSendStream[str],
+    rabbitmq_config: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """
+    Clean up transcript using LLM via RabbitMQ worker, sending consolidated segments to RabbitMQ as they arrive.
     
-    # Clean up all models from memory
-    del model
-    del tokenizer
-    del pipeline
-    unload_models_from_memory()
+    Consolidates consecutive segments from the same speaker before sending to cleanup.
     
-    return transcript
+    Args:
+        segment_stream_receive: Stream to receive raw transcript segments from
+        transcript_send_stream: Stream for sending final transcript
+        rabbitmq_config: RabbitMQ connection configuration
+        
+    Returns:
+        Cleaned transcript segments
+    """
+    work_queue = "llm/cleanup"
+    response_queue = f"{work_queue}-{uuid.uuid4()}"
+    job_id = str(uuid.uuid4())
+    
+    # Create streams for consolidated segments and cleanup responses
+    consolidated_send, consolidated_receive = anyio.create_memory_object_stream[dict[str, Any]](max_buffer_size=100)
+    cleanup_response_send, cleanup_response_receive = anyio.create_memory_object_stream[dict[str, Any]](max_buffer_size=100)
+    
+    async def consolidate_segments_by_speaker():
+        """Consolidate consecutive segments from the same speaker and forward to cleanup."""
+        current_speaker = None
+        accumulated_segment = None
+        
+        async with segment_stream_receive, consolidated_send:
+            async for segment in segment_stream_receive:
+                speaker = segment.get('speaker')
+                print(f"Received segment for consolidation: {speaker} - {segment.get('text', '')[:50]}...")
+                
+                if current_speaker != speaker:
+                    # Different speaker - send accumulated segment if it exists
+                    if accumulated_segment is not None:
+                        await consolidated_send.send(accumulated_segment)
+                        print(f"Sent consolidated segment: {accumulated_segment.get('speaker')}")
+                    
+                    # Start new accumulated segment
+                    accumulated_segment = {
+                        'speaker': speaker,
+                        'start': segment.get('start'),
+                        'end': segment.get('end'),
+                        'text': segment.get('text', ''),
+                    }
+                    current_speaker = speaker
+                else:
+                    # Same speaker - merge with current segment
+                    if accumulated_segment is not None:
+                        accumulated_segment['text'] += ' ' + segment.get('text', '')
+                        accumulated_segment['end'] = segment.get('end')
+            
+            # Send the last accumulated segment
+            if accumulated_segment is not None:
+                await consolidated_send.send(accumulated_segment)
+                print(f"Sent final consolidated segment: {accumulated_segment.get('speaker')}")
+    
+    async def send_to_rabbitmq():
+        """Send consolidated segments to RabbitMQ as they arrive and collect responses."""
+        from utils import create_ssl_context
+        
+        received_segments = set()
+        cleaned_segments = []
+        segment_count = 0
+        total_segments = None
+        
+        # Connect to RabbitMQ
+        ssl_context = create_ssl_context()
+        connection = await aio_pika.connect_robust(
+            host=rabbitmq_config['host'],
+            port=rabbitmq_config['port'],
+            login=rabbitmq_config['username'],
+            password=rabbitmq_config['password'],
+            ssl=True,
+            ssl_context=ssl_context,
+        )
+        
+        async with connection:
+            channel = await connection.channel()
+            await channel.set_qos(prefetch_count=10)
+            
+            # Declare queues
+            await channel.declare_queue(work_queue, durable=True)
+            response_queue_obj = await channel.declare_queue(response_queue, durable=True)
+            
+            # Start consuming responses in background task
+            async def consume_responses():
+                nonlocal total_segments
+                async with response_queue_obj.iterator() as queue_iter:
+                    async for message in queue_iter:
+                        async with message.process():
+                            response = json.loads(message.body.decode())
+                            
+                            if response.get("job_id") != job_id:
+                                continue
+                            
+                            segment_num = response.get("segment_count")
+                            print(f"Received cleanup response for segment {segment_num}")
+                            
+                            # Track this segment
+                            if segment_num is not None:
+                                received_segments.add(segment_num)
+                            
+                            if response.get("status") == "success":
+                                cleaned_segments.append(response.get("segment"))
+                            else:
+                                # On error, keep original segment
+                                print(f"Error cleaning segment {segment_num}: {response.get('error')}")
+                                segment = response.get("segment")
+                                cleaned_segments.append(segment)
+                            
+                            # Stop when all segments received
+                            if total_segments is not None and len(received_segments) == total_segments:
+                                print(f"Received all {total_segments} cleaned segments")
+                                break
+            
+            # Start response consumer task
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(consume_responses)
+                
+                # Send consolidated segments as they arrive
+                async with consolidated_receive:
+                    async for segment in consolidated_receive:
+                        job_message = {
+                            'job_id': job_id,
+                            'reply_to': response_queue,
+                            'segment': {
+                                'speaker': segment.get('speaker'),
+                                'start': segment.get('start'),
+                                'end': segment.get('end'),
+                                'text': segment.get('text'),
+                                'segment_count': segment_count,
+                            },
+                            'segment_count': segment_count,
+                            'total_segments': None,  # Don't know total yet
+                        }
+                        
+                        # Send job to work queue immediately
+                        await channel.default_exchange.publish(
+                            aio_pika.Message(body=json.dumps(job_message).encode()),
+                            routing_key=work_queue,
+                        )
+                        print(f"Sent consolidated segment {segment_count} to cleanup queue as it arrived")
+                        segment_count += 1
+                
+                # Now we know the total
+                total_segments = segment_count
+                print(f"All {total_segments} consolidated segments sent to cleanup queue, waiting for responses...")
+                
+                # Wait for all responses to complete (consume_responses task will complete when done)
+            
+            # Delete the reply-to queue now that we're done consuming
+            await channel.queue_delete(response_queue)
+        
+        # Sort and send results
+        result_sorted = sorted(cleaned_segments, key=lambda x: x.get("segment_count", 0))
+        
+        # Send to output stream
+        async with cleanup_response_send:
+            await cleanup_response_send.send(result_sorted)
+    
+    # Run consolidation and RabbitMQ tasks concurrently
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(consolidate_segments_by_speaker)
+        tg.start_soon(send_to_rabbitmq)
+    
+    # Collect final result
+    cleaned_segments_sorted = []
+    async with cleanup_response_receive:
+        async for segments in cleanup_response_receive:
+            cleaned_segments_sorted = segments
+            break
+    
+    await transcript_send_stream.send(produce_transcript(cleaned_segments_sorted))
+    LOGGER.info(f"{cleaned_segments_sorted}")
+    
+    return cleaned_segments_sorted
 
 
 def save_transcript(transcript, output_file):
@@ -694,6 +803,7 @@ BEGIN OUTPUT TEXT:
 """
     text = text.replace("...", "")
     prompt = prompt_template.format(text=text)
+    print(prompt)
     full_output = ""
     end_delimiter = "END OUTPUT TEXT"
     while end_delimiter not in full_output[len(prompt):]:

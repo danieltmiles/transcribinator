@@ -1,7 +1,6 @@
 import json
 import numpy as np
 import aio_pika
-import sys
 import argparse
 import torch
 import time
