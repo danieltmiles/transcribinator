@@ -38,8 +38,13 @@ END INPUT TEXT
 BEGIN OUTPUT TEXT:
 """
     text = text.replace("...", "")
+    if len(text) < 10:
+        return text
+    print(f"length of transcript text: {len(text)}")
     prompt = prompt_template.format(text=text)
-    full_output = prompt + quantized_generate_from_prompt(prompt, model, tokenizer, model_type)
+    generated = quantized_generate_from_prompt(prompt, model, tokenizer, model_type)
+    print(f"generated: {generated}")
+    full_output = prompt + generated
     #full_output = tokenizer.decode(outputs[0], skip_special_tokens=False)
     # Extract the cleaned text between delimiters
     begin_delim = "BEGIN OUTPUT TEXT:"
@@ -57,7 +62,7 @@ BEGIN OUTPUT TEXT:
                 # If no BEGIN found, just get text before END
                 chunk = full_output[:end_indexes[0]]
             cleaned_text = chunk.strip()
-            print(cleaned_text)
+            print(f"{cleaned_text=}")
             return cleaned_text
     
     # If no proper delimiter found, return None or the full output
