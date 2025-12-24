@@ -358,42 +358,42 @@ async def process_message(message: AbstractIncomingMessage, model, tokenizer):
         'total_windows': int
     }
     """
-    async with message.process():
+    try:
+        print(f"Received message")
+        body = json.loads(message.body.decode())
+        
+        job_id = body.get('job_id')
+        reply_to = body.get('reply_to')
+        window_id = body.get('window_id')
+        transcript_window = body.get('transcript_window', '')
+        total_windows = body.get('total_windows')
+        
+        print(f"Processing job {job_id}, window {window_id}/{total_windows}")
+        print(f"Transcript window length: {len(transcript_window)} chars")
+        
+        # Run speaker identification in thread pool to prevent blocking
+        loop = asyncio.get_event_loop()
+        speaker_result = await loop.run_in_executor(
+            None,
+            identify_speakers,
+            transcript_window,
+            model,
+            tokenizer
+        )
+        
+        print(f"Window {window_id}: found {len(speaker_result)} speaker identifications")
+        
+        # Prepare response
+        response = {
+            'job_id': job_id,
+            'status': 'success',
+            'window_id': window_id,
+            'result': speaker_result,
+            'total_windows': total_windows,
+        }
+        
+        # Send response with error handling for invalid state
         try:
-            print(f"Received message")
-            body = json.loads(message.body.decode())
-            
-            job_id = body.get('job_id')
-            reply_to = body.get('reply_to')
-            window_id = body.get('window_id')
-            transcript_window = body.get('transcript_window', '')
-            total_windows = body.get('total_windows')
-            
-            print(f"Processing job {job_id}, window {window_id}/{total_windows}")
-            print(f"Transcript window length: {len(transcript_window)} chars")
-            
-            # Run speaker identification in thread pool to prevent blocking
-            loop = asyncio.get_event_loop()
-            speaker_result = await loop.run_in_executor(
-                None,
-                identify_speakers,
-                transcript_window,
-                model,
-                tokenizer
-            )
-            
-            print(f"Window {window_id}: found {len(speaker_result)} speaker identifications")
-            
-            # Prepare response
-            response = {
-                'job_id': job_id,
-                'status': 'success',
-                'window_id': window_id,
-                'result': speaker_result,
-                'total_windows': total_windows,
-            }
-            
-            # Send response
             channel = message.channel
             await channel.basic_publish(
                 body=json.dumps(response).encode(),
@@ -403,29 +403,39 @@ async def process_message(message: AbstractIncomingMessage, model, tokenizer):
                     delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
                 ),
             )
+        except (aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed) as channel_error:
+            print(f"Channel error while sending response for job {job_id}: {channel_error}")
+            print(f"Message will be re-queued for retry")
+            # Nack the message so it gets requeued
+            await message.nack(requeue=True)
+            return
 
-            print(f"Job {job_id} window {window_id} completed and response sent to {reply_to}")
+        print(f"Job {job_id} window {window_id} completed and response sent to {reply_to}")
+        
+        # Acknowledge successful processing
+        await message.ack()
+        
+    except Exception as e:
+        print(f"Error processing message: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Try to send error response if possible
+        try:
+            body = json.loads(message.body.decode())
+            job_id = body.get('job_id', 'unknown')
+            reply_to = body.get('reply_to')
+            window_id = body.get('window_id')
             
-        except Exception as e:
-            print(f"Error processing message: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Send error response if possible
-            try:
-                body = json.loads(message.body.decode())
-                job_id = body.get('job_id', 'unknown')
-                reply_to = body.get('reply_to')
-                window_id = body.get('window_id')
+            if reply_to:
+                error_response = {
+                    'job_id': job_id,
+                    'status': 'error',
+                    'error': str(e),
+                    'window_id': window_id
+                }
                 
-                if reply_to:
-                    error_response = {
-                        'job_id': job_id,
-                        'status': 'error',
-                        'error': str(e),
-                        'window_id': window_id
-                    }
-                    
+                try:
                     channel = message.channel
                     await channel.default_exchange.publish(
                         aio_pika.Message(
@@ -433,46 +443,109 @@ async def process_message(message: AbstractIncomingMessage, model, tokenizer):
                         ),
                         routing_key=reply_to,
                     )
-            except Exception as error_e:
-                print(f"Error sending error response: {error_e}")
-            
-            raise
+                except (aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed):
+                    print(f"Could not send error response due to channel error - message will be requeued")
+        except Exception as error_e:
+            print(f"Error sending error response: {error_e}")
+        
+        # Nack the message so it gets requeued (RabbitMQ will retry)
+        try:
+            await message.nack(requeue=True)
+        except Exception as nack_error:
+            print(f"Error nacking message: {nack_error}")
 
 
 async def main(config):
     """
-    Main function to start the speaker identification consumer.
+    Main function to start the speaker identification consumer with reconnection logic.
+    Handles connection failures and automatically reconnects with exponential backoff.
     """
     print("Initializing speaker identification consumer...")
-    print(f"Connecting to RabbitMQ at {config['host']}:{config['port']}...")
+    
+    # Retry configuration
+    max_retries = 10
+    base_retry_delay = 2  # seconds
+    max_retry_delay = 60  # seconds
+    
+    # Load model once at startup
+    print("Loading LLM model...")
+    model_path = config.get('model_path')
+    model, tokenizer = load_llm_model(model_path)
     
     ssl_context = create_ssl_context()
     
-    connection = await aio_pika.connect_robust(
-        host=config['host'],
-        port=config['port'],
-        login=config['username'],
-        password=config['password'],
-        ssl=True,
-        ssl_context=ssl_context,
-    )
+    retry_count = 0
     
-    async with connection:
-        channel = await connection.channel()
-        await channel.set_qos(prefetch_count=1)
-        
-        work_queue = config['work_queue']
-        queue = await channel.declare_queue(work_queue, durable=True)
-        
-        print(f"Listening for speaker identification jobs on queue: {work_queue}")
-        print("Waiting for jobs. To exit press CTRL+C")
-
-        model_path = config.get('model_path')
-        model, tokenizer = load_llm_model(model_path)
-        
-        async with queue.iterator() as queue_iter:
-            async for message in queue_iter:
-                await process_message(message, model, tokenizer)
+    while True:
+        try:
+            # Connect to RabbitMQ
+            print(f"Connecting to RabbitMQ at {config['host']}:{config['port']}...")
+            
+            connection = await aio_pika.connect_robust(
+                host=config['host'],
+                port=config['port'],
+                login=config['username'],
+                password=config['password'],
+                ssl=True,
+                ssl_context=ssl_context,
+            )
+            
+            # Reset retry count on successful connection
+            retry_count = 0
+            
+            async with connection:
+                channel = await connection.channel()
+                await channel.set_qos(prefetch_count=1)
+                
+                work_queue = config['work_queue']
+                queue = await channel.declare_queue(work_queue, durable=True)
+                
+                print(f"Successfully connected! Listening for speaker identification jobs on queue: {work_queue}")
+                print("Waiting for jobs. To exit press CTRL+C")
+                
+                async with queue.iterator() as queue_iter:
+                    async for message in queue_iter:
+                        try:
+                            await process_message(message, model, tokenizer)
+                        except (aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed) as channel_err:
+                            print(f"Channel error during message processing: {channel_err}")
+                            print("Will attempt to reconnect...")
+                            # Break out of the message loop to reconnect
+                            raise
+                        except Exception as e:
+                            print(f"Unexpected error processing message: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            # Continue processing other messages
+                            
+        except (aio_pika.AMQPError, aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed, ConnectionError) as conn_error:
+            retry_count += 1
+            if retry_count > max_retries:
+                print(f"Max retries ({max_retries}) exceeded. Giving up.")
+                raise
+            
+            # Calculate exponential backoff delay
+            delay = min(base_retry_delay * (2 ** (retry_count - 1)), max_retry_delay)
+            print(f"Connection error: {conn_error}")
+            print(f"Reconnection attempt {retry_count}/{max_retries} in {delay} seconds...")
+            await asyncio.sleep(delay)
+            
+        except KeyboardInterrupt:
+            print("\nShutting down gracefully...")
+            break
+        except Exception as e:
+            print(f"Unexpected error in main loop: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            retry_count += 1
+            if retry_count > max_retries:
+                print(f"Max retries ({max_retries}) exceeded. Giving up.")
+                raise
+            
+            delay = min(base_retry_delay * (2 ** (retry_count - 1)), max_retry_delay)
+            print(f"Retrying in {delay} seconds...")
+            await asyncio.sleep(delay)
 
 
 if __name__ == "__main__":

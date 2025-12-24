@@ -12,7 +12,6 @@ async def make_transcript(audio_file_path: str, result_send: MemoryObjectSendStr
     transcript_send_stream, transcript_receive_stream = create_memory_object_stream[str](max_buffer_size=1000)
     await process_audio(
         audio_file_path=audio_file_path,
-        min_segment_length=1.0,
         transcript_send_stream=transcript_send_stream,
     )
     print(f"finished process audio for {audio_file_path}")
@@ -46,7 +45,7 @@ async def main():
     semaphore = anyio.Semaphore(3)
     result_send, result_receive = create_memory_object_stream[str](max_buffer_size=10)
     async with anyio.create_task_group() as tg:
-        for audio_file in audio_files[:2]:
+        for audio_file in audio_files:
             # Start whisper jobs - will stream results to segment_send_stream
             tg.start_soon(
                 limited_worker,

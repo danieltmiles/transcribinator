@@ -100,63 +100,63 @@ async def process_message(message: aio_pika.IncomingMessage, whisper_model):
         'word_timestamps': bool
     }
     """
-    async with message.process():
-        try:
-            print(f"Received message")
-            body = json.loads(message.body.decode())
-            
-            job_id = body.get('job_id')
-            reply_to = body.get('reply_to')
-            audio_segment = body.get('audio_segment', {})
-            
-            # Extract parameters
-            temperature = body.get('temperature', 0.2)
-            language = body.get('language', 'en')
-            initial_prompt = body.get('initial_prompt')
-            word_timestamps = body.get('word_timestamps', True)
-            speaker = body.get('speaker', audio_segment.get('speaker', 'Unknown'))
-            segment_count = body.get("segment_count")
-            total_segments = body.get("total_segments")
+    try:
+        print(f"Received message")
+        body = json.loads(message.body.decode())
+        
+        job_id = body.get('job_id')
+        reply_to = body.get('reply_to')
+        audio_segment = body.get('audio_segment', {})
+        
+        # Extract parameters
+        temperature = body.get('temperature', 0.2)
+        language = body.get('language', 'en')
+        initial_prompt = body.get('initial_prompt')
+        word_timestamps = body.get('word_timestamps', True)
+        speaker = body.get('speaker', audio_segment.get('speaker', 'Unknown'))
+        segment_count = body.get("segment_count")
+        total_segments = body.get("total_segments")
 
-            print(f"Processing job {job_id} for speaker {speaker}")
-            
-            # Convert audio data from list back to numpy array
-            audio_data = np.array(audio_segment.get('audio', []), dtype=np.float32)
-            
-            if len(audio_data) == 0:
-                raise ValueError("Empty audio data received")
-            
-            print(f"Audio data shape: {audio_data.shape}, duration: ~{len(audio_data) / 16000:.2f}s")
-            
-            # Run transcription in thread pool to prevent blocking the event loop
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                perform_transcription,
-                audio_data,
-                whisper_model,
-                temperature,
-                language,
-                initial_prompt,
-                word_timestamps
-            )
-            
-            # Prepare response
-            response = {
-                'job_id': job_id,
-                'status': 'success',
-                'transcription': result,
-                'speaker': speaker,
-                'audio_segment': {
-                    'start': audio_segment.get('start'),
-                    'end': audio_segment.get('end'),
-                    'speaker': audio_segment.get('speaker')
-                },
-                'segment_count': segment_count,
-                'total_segments': total_segments,
-            }
-            
-            # Get channel from message
+        print(f"Processing job {job_id} for speaker {speaker}")
+        
+        # Convert audio data from list back to numpy array
+        audio_data = np.array(audio_segment.get('audio', []), dtype=np.float32)
+        
+        if len(audio_data) == 0:
+            raise ValueError("Empty audio data received")
+        
+        print(f"Audio data shape: {audio_data.shape}, duration: ~{len(audio_data) / 16000:.2f}s")
+        
+        # Run transcription in thread pool to prevent blocking the event loop
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            perform_transcription,
+            audio_data,
+            whisper_model,
+            temperature,
+            language,
+            initial_prompt,
+            word_timestamps
+        )
+        
+        # Prepare response
+        response = {
+            'job_id': job_id,
+            'status': 'success',
+            'transcription': result,
+            'speaker': speaker,
+            'audio_segment': {
+                'start': audio_segment.get('start'),
+                'end': audio_segment.get('end'),
+                'speaker': audio_segment.get('speaker')
+            },
+            'segment_count': segment_count,
+            'total_segments': total_segments,
+        }
+        
+        # Get channel from message with error handling for invalid state
+        try:
             channel = message.channel
             await channel.basic_publish(
                 body=json.dumps(response).encode(),
@@ -166,27 +166,37 @@ async def process_message(message: aio_pika.IncomingMessage, whisper_model):
                     delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
                 ),
             )
+        except (aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed) as channel_error:
+            print(f"Channel error while sending response for job {job_id}: {channel_error}")
+            print(f"Message will be re-queued for retry")
+            # Nack the message so it gets requeued
+            await message.nack(requeue=True)
+            return
 
-            print(f"Job {job_id} completed and response sent to {reply_to}")
+        print(f"Job {job_id} completed and response sent to {reply_to}")
+        
+        # Acknowledge successful processing
+        await message.ack()
+        
+    except Exception as e:
+        print(f"Error processing message: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Try to send error response if possible
+        try:
+            body = json.loads(message.body.decode())
+            job_id = body.get('job_id', 'unknown')
+            reply_to = body.get('reply_to')
             
-        except Exception as e:
-            print(f"Error processing message: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Send error response if possible
-            try:
-                body = json.loads(message.body.decode())
-                job_id = body.get('job_id', 'unknown')
-                reply_to = body.get('reply_to')
+            if reply_to:
+                error_response = {
+                    'job_id': job_id,
+                    'status': 'error',
+                    'error': str(e)
+                }
                 
-                if reply_to:
-                    error_response = {
-                        'job_id': job_id,
-                        'status': 'error',
-                        'error': str(e)
-                    }
-                    
+                try:
                     channel = message.channel
                     await channel.default_exchange.publish(
                         aio_pika.Message(
@@ -194,56 +204,115 @@ async def process_message(message: aio_pika.IncomingMessage, whisper_model):
                         ),
                         routing_key=reply_to,
                     )
-            except Exception as error_e:
-                print(f"Error sending error response: {error_e}")
-            
-            # Re-raise to reject the message
-            raise
+                except (aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed):
+                    print(f"Could not send error response due to channel error - message will be requeued")
+        except Exception as error_e:
+            print(f"Error sending error response: {error_e}")
+        
+        # Nack the message so it gets requeued (RabbitMQ will retry)
+        try:
+            await message.nack(requeue=True)
+        except Exception as nack_error:
+            print(f"Error nacking message: {nack_error}")
 
 
 async def main(config):
     """
-    Main function to start the whisper transcription consumer.
+    Main function to start the whisper transcription consumer with reconnection logic.
+    Handles connection failures and automatically reconnects with exponential backoff.
     """
     print("Initializing Whisper transcription consumer...")
     
-    # Load the Whisper model once
-    whisper_model = load_whisper_model()
+    # Retry configuration
+    max_retries = 10
+    base_retry_delay = 2  # seconds
+    max_retry_delay = 60  # seconds
     
-    # Connect to RabbitMQ with TLS
-    print(f"Connecting to RabbitMQ at {config['host']}:{config['port']}...")
+    # Load the Whisper model once at startup
+    print("Loading Whisper model...")
+    whisper_model = load_whisper_model()
     
     ssl_context = create_ssl_context()
     # If using self-signed certificates, uncomment:
     # ssl_context = create_ssl_context(verify=False)
     
-    connection = await aio_pika.connect_robust(
-        host=config['host'],
-        port=config['port'],
-        login=config['username'],
-        password=config['password'],
-        ssl=True,
-        ssl_context=ssl_context,
-    )
+    retry_count = 0
     
-    async with connection:
-        # Create channel
-        channel = await connection.channel()
-        
-        # Set QoS to process one message at a time
-        await channel.set_qos(prefetch_count=1)
-        
-        # Declare the work queue
-        work_queue = config['work_queue']
-        queue = await channel.declare_queue(work_queue, durable=True)
-        
-        print(f"Listening for transcription jobs on queue: {work_queue}")
-        print("Waiting for transcription jobs. To exit press CTRL+C")
-        
-        # Start consuming messages
-        async with queue.iterator() as queue_iter:
-            async for message in queue_iter:
-                await process_message(message, whisper_model)
+    while True:
+        try:
+            # Connect to RabbitMQ with TLS
+            print(f"Connecting to RabbitMQ at {config['host']}:{config['port']}...")
+            
+            connection = await aio_pika.connect_robust(
+                host=config['host'],
+                port=config['port'],
+                login=config['username'],
+                password=config['password'],
+                ssl=True,
+                ssl_context=ssl_context,
+            )
+            
+            # Reset retry count on successful connection
+            retry_count = 0
+            
+            async with connection:
+                # Create channel
+                channel = await connection.channel()
+                
+                # Set QoS to process one message at a time
+                await channel.set_qos(prefetch_count=1)
+                
+                # Declare the work queue
+                work_queue = config['work_queue']
+                queue = await channel.declare_queue(work_queue, durable=True)
+                
+                print(f"Successfully connected! Listening for transcription jobs on queue: {work_queue}")
+                print("Waiting for transcription jobs. To exit press CTRL+C")
+                
+                # Start consuming messages
+                async with queue.iterator() as queue_iter:
+                    async for message in queue_iter:
+                        try:
+                            await process_message(message, whisper_model)
+                        except (aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed) as channel_err:
+                            print(f"Channel error during message processing: {channel_err}")
+                            print("Will attempt to reconnect...")
+                            # Break out of the message loop to reconnect
+                            raise
+                        except Exception as e:
+                            print(f"Unexpected error processing message: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            # Continue processing other messages
+                            
+        except (aio_pika.AMQPError, aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed, ConnectionError) as conn_error:
+            retry_count += 1
+            if retry_count > max_retries:
+                print(f"Max retries ({max_retries}) exceeded. Giving up.")
+                raise
+            
+            # Calculate exponential backoff delay
+            delay = min(base_retry_delay * (2 ** (retry_count - 1)), max_retry_delay)
+            print(f"Connection error: {conn_error}")
+            print(f"Reconnection attempt {retry_count}/{max_retries} in {delay} seconds...")
+            await asyncio.sleep(delay)
+            
+        except KeyboardInterrupt:
+            print("\nShutting down gracefully...")
+            break
+        except Exception as e:
+            print(f"Unexpected error in main loop: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            retry_count += 1
+            if retry_count > max_retries:
+                print(f"Max retries ({max_retries}) exceeded. Giving up.")
+                raise
+            
+            delay = min(base_retry_delay * (2 ** (retry_count - 1)), max_retry_delay)
+            print(f"Retrying in {delay} seconds...")
+            await asyncio.sleep(delay)
 
 
 if __name__ == "__main__":

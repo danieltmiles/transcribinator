@@ -247,7 +247,7 @@ def format_segment_for_speaker_identification(segment: dict[str, Any]) -> str:
 
 
 async def send_diarization_job_to_queue(audio_file_path: str, rabbitmq_config: dict[str, Any]) -> None | DiarizeOutput:
-    """Send diarization job to RabbitMQ and wait for result using aio_pika."""
+    """Send diarization job to RabbitMQ and wait for result using aio_pika with error handling."""
     from utils import create_ssl_context
     
     # Generate unique job ID
@@ -297,42 +297,53 @@ async def send_diarization_job_to_queue(audio_file_path: str, rabbitmq_config: d
     
     result = None
     
-    async with connection:
-        channel = await connection.channel()
-        
-        # Declare queues
-        work_queue_obj = await channel.declare_queue(work_queue, durable=True)
-        response_queue_obj = await channel.declare_queue(response_queue, durable=True)
-        
-        # Send job to work queue
-        await channel.default_exchange.publish(
-            aio_pika.Message(body=json.dumps(job_message).encode()),
-            routing_key=work_queue,
-        )
-        
-        print(f"Sent diarization job {job_id} to queue {work_queue}")
-        print(f"Waiting for diarization result for job {job_id}...")
-        
-        # Wait for response
-        async with response_queue_obj.iterator() as queue_iter:
-            async for message in queue_iter:
-                async with message.process():
-                    response = json.loads(message.body.decode())
-                    
-                    if response.get('job_id') == job_id:
-                        if response.get('status') == 'success':
-                            # Deserialize diarization result
-                            diarization_encoded = response.get('diarization')
-                            diarization_bytes = base64.b64decode(diarization_encoded)
-                            result = pickle.loads(diarization_bytes)
-                            print(f"Received diarization result for job {job_id}")
-                        else:
-                            error = response.get('error', 'Unknown error')
-                            raise RuntimeError(f"Diarization job failed: {error}")
-                        break
-        
-        # Delete the reply-to queue now that we're done consuming
-        await channel.queue_delete(response_queue)
+    try:
+        async with connection:
+            channel = await connection.channel()
+            
+            # Declare queues
+            work_queue_obj = await channel.declare_queue(work_queue, durable=True)
+            response_queue_obj = await channel.declare_queue(response_queue, durable=True)
+            
+            # Send job to work queue
+            await channel.default_exchange.publish(
+                aio_pika.Message(body=json.dumps(job_message).encode()),
+                routing_key=work_queue,
+            )
+            
+            print(f"Sent diarization job {job_id} to queue {work_queue}")
+            print(f"Waiting for diarization result for job {job_id}...")
+            
+            # Wait for response
+            async with response_queue_obj.iterator() as queue_iter:
+                async for message in queue_iter:
+                    try:
+                        async with message.process():
+                            response = json.loads(message.body.decode())
+                            
+                            if response.get('job_id') == job_id:
+                                if response.get('status') == 'success':
+                                    # Deserialize diarization result
+                                    diarization_encoded = response.get('diarization')
+                                    diarization_bytes = base64.b64decode(diarization_encoded)
+                                    result = pickle.loads(diarization_bytes)
+                                    print(f"Received diarization result for job {job_id}")
+                                else:
+                                    error = response.get('error', 'Unknown error')
+                                    raise RuntimeError(f"Diarization job failed: {error}")
+                                break
+                    except (aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed) as channel_error:
+                        print(f"Channel error while waiting for diarization response: {channel_error}")
+                        raise
+            
+            # Delete the reply-to queue now that we're done consuming
+            try:
+                await channel.queue_delete(response_queue)
+            except (aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed):
+                print("Could not delete response queue due to channel error")
+    except (aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed, aio_pika.AMQPError) as e:
+        print(f"RabbitMQ connection error in diarization: {e}")
+        raise
     
     if result is None:
         raise RuntimeError("Failed to receive diarization result")
@@ -426,15 +437,18 @@ async def send_whisper_jobs(
                     if segment_count is None:
                         print("bad message, no segment count, refusing to process")
                         continue
-                    print(f"Received segment {segment_count}")
+                    print(f"Received segment {segment_count} with speaker {response.get('speaker')}")
                     
                     # Track this segment
-                    if len(received_segments) == 0 or segment_count == received_segments[-1] + 1:
+                    if segment_count == 0 or (len(received_segments) > 0 and segment_count == received_segments[-1] + 1):
+                        print(f"appending segment {segment_count} to received_segments with speaker {response.get('speaker')}")
                         received_segments.append(segment_count)
                     else:
                         out_of_order_responses.append(response)
+                        print(f"length of out of order segments: {len(out_of_order_responses)}")
                         continue
 
+                    print(f"before process segment, current speaker is {current_speaker}, speaker in msg is {response.get('speaker')}")
                     accumulated_segment, current_speaker = await process_segment(
                         accumulated_segment,
                         current_speaker,
@@ -442,6 +456,7 @@ async def send_whisper_jobs(
                         segment_count,
                         segment_stream_send,
                     )
+                    print(f"after process segment, current speaker is {current_speaker}, speaker in msg is {response.get('speaker')}")
 
                     # reconcile any out-of-order segments
                     out_of_order_responses = sorted(out_of_order_responses,
@@ -451,6 +466,7 @@ async def send_whisper_jobs(
                         out_of_order_segment_number = out_of_order_response["segment_count"]
                         if out_of_order_segment_number == received_segments[-1] + 1:
                             received_segments.append(out_of_order_segment_number)
+                            print(f"before reconcile segment, current speaker is {current_speaker}, speaker in msg is {response.get('speaker')}")
                             accumulated_segment, current_speaker = await process_segment(
                                 accumulated_segment,
                                 current_speaker,
@@ -458,7 +474,9 @@ async def send_whisper_jobs(
                                 out_of_order_segment_number,
                                 segment_stream_send,
                             )
+                            print(f"after reconcile segment, current speaker is {current_speaker}, speaker in msg is {response.get('speaker')}")
                         else:
+                            print(f"unable to reconcile segment {out_of_order_segment_number}, saving for later")
                             unreconciled_out_of_order_segments.append(out_of_order_response)
                     out_of_order_responses = unreconciled_out_of_order_segments
 
@@ -485,12 +503,17 @@ async def process_segment(
     segment_stream_send: MemoryObjectSendStream,
 ) -> tuple[dict[str, Any], str]:
     speaker = response["speaker"]
+    print(f"processing whisper segment from {speaker=}")
     text = get_text_from_segment(response)
 
     if current_speaker != speaker:
+        print(f"speaker change! {current_speaker=}, {speaker=}")
         # Send accumulated segment if exists
         if accumulated_segment is not None:
+            print("sending accumulated_segment to cleanup memory object stream")
             await segment_stream_send.send(accumulated_segment)
+        else:
+            print(f"detected different speaker, {current_speaker=}, {speaker=}, but no accumulated segment existed")
 
         # Start new accumulated segment
         accumulated_segment = {
@@ -526,7 +549,7 @@ def get_text_from_segment(response) -> str:
     return text
 
 
-async def process_audio(audio_file_path: str, min_segment_length: float, transcript_send_stream: MemoryObjectSendStream[str]):
+async def process_audio(audio_file_path: str, transcript_send_stream: MemoryObjectSendStream[str]):
     """
     Process audio file for speaker identification and transcription.
     
@@ -959,9 +982,22 @@ async def journalistic_courtesy_streaming(
                         print(f"Sent consolidated segment {segment.get('segment_count')} to cleanup queue")
                         segment_count += 1
                 
-                # Now we know the total
+                # Now we know the total - send a stop-job message with the total segment count
                 total_segments = segment_count
                 print(f"All {total_segments} consolidated segments sent to cleanup queue")
+                
+                # Send stop-job message to notify cleanup job of the total segments
+                stop_job_message = {
+                    'job_id': job_id,
+                    'reply_to': response_queue,
+                    'is_stop_job': True,
+                    'total_segments': total_segments,
+                }
+                await channel.default_exchange.publish(
+                    aio_pika.Message(body=json.dumps(stop_job_message).encode()),
+                    routing_key=work_queue,
+                )
+                print(f"Sent stop-job message with total_segments={total_segments}")
             
             # Delete the reply-to queue
             await channel.queue_delete(response_queue)

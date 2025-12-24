@@ -150,7 +150,7 @@ class JobQueueManager:
             
             async with create_task_group() as tg:
                 # Start AI processing
-                tg.start_soon(ai_process_audio, file_path, 1.0, progress_send_stream, transcript_send_stream)
+                tg.start_soon(ai_process_audio, file_path, progress_send_stream, transcript_send_stream)
                 
                 # Track progress stages
                 stage_progress = {"diarization": 0, "transcription": 0, "cleanup": 0}
