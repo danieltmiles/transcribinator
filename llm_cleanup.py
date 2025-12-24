@@ -6,32 +6,16 @@ import time
 import asyncio
 
 from aio_pika.abc import AbstractIncomingMessage
+from aiormq import AMQPError, ChannelInvalidStateError, ChannelClosed
 from pamqp.commands import Basic
 from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen2ForCausalLM
 
-from utils import load_config, create_ssl_context
+from utils import load_config, create_ssl_context, load_quantized_llm_model, quantized_generate_from_prompt
+
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "cpu")
 
 
-def load_llm_model():
-    """
-    Returns:
-        tuple: (model_kit, tokenizer)
-    """
-    model_name = "Qwen/Qwen2.5-7B-Instruct"
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype = torch.float16,  # Force FP16
-        device_map = "auto",
-        trust_remote_code = True,
-        max_memory = {0: "22GiB"},  # Reserve a bit less than total VRAM
-    )
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code = True)
-    return model, tokenizer
-
-
-def llm_clean(text: str, model, tokenizer) -> str | None:
+def llm_clean(text: str, model, tokenizer, model_type) -> str | None:
     """Clean transcribed text using LLM with mlx_engine."""
     prompt_template = """You are a transcript editor. The following text was transcribed from an audio recording by an unskilled person who
 made errors grouping the words into sentences and sometimes typed a word or phrase multiple times, when the speaker did not say it.
@@ -55,31 +39,8 @@ BEGIN OUTPUT TEXT:
 """
     text = text.replace("...", "")
     prompt = prompt_template.format(text=text)
-    test_encoding = tokenizer(prompt, return_tensors="pt")
-    prompt_length = test_encoding.input_ids.size(1)
-    max_length = min(prompt_length + 200, 32000)
-    encoded = tokenizer(
-        prompt,
-        return_tensors="pt",
-        padding=False,
-        truncation=True,
-        max_length=max_length,
-    )
-    attention_mask = encoded['attention_mask'].to(device)
-    try:
-        outputs = model.generate(
-            encoded.input_ids.to(device),
-            attention_mask=attention_mask,
-            max_new_tokens=prompt_length,  # Allow some buffer for expanded text
-            temperature=0.2,  # Lower temperature for more consistent outputs
-            do_sample=True,
-            top_p=0.9,
-            repetition_penalty=1.2
-        )
-    except RuntimeError as rte:
-        print(f"experienced rte: {rte}")
-        return ""
-    full_output = tokenizer.decode(outputs[0], skip_special_tokens=False)
+    full_output = prompt + quantized_generate_from_prompt(prompt, model, tokenizer, model_type)
+    #full_output = tokenizer.decode(outputs[0], skip_special_tokens=False)
     # Extract the cleaned text between delimiters
     begin_delim = "BEGIN OUTPUT TEXT:"
     full_output = full_output[len(prompt) - len(begin_delim) - 1:]
@@ -95,14 +56,16 @@ BEGIN OUTPUT TEXT:
             else:
                 # If no BEGIN found, just get text before END
                 chunk = full_output[:end_indexes[0]]
-            return chunk.strip()
+            cleaned_text = chunk.strip()
+            print(cleaned_text)
+            return cleaned_text
     
     # If no proper delimiter found, return None or the full output
     print("Warning: END OUTPUT TEXT delimiter not found in output")
     return None
 
 
-async def process_message(message: AbstractIncomingMessage, model: Qwen2ForCausalLM, tokenizer: AutoTokenizer, job_tracker: dict):
+async def process_message(message: AbstractIncomingMessage, model, tokenizer, model_type: str, job_tracker: dict):
     """
     Process an LLM cleanup job message from RabbitMQ.
     
@@ -172,7 +135,8 @@ async def process_message(message: AbstractIncomingMessage, model: Qwen2ForCausa
             llm_clean,
             text,
             model,
-            tokenizer
+            tokenizer,
+            model_type,
         )
         
         # Prepare response
@@ -267,7 +231,7 @@ async def main(config):
     
     # Load model once at startup
     print("Loading LLM model...")
-    model, tokenizer = load_llm_model()
+    model, tokenizer, model_type = load_quantized_llm_model(str(device), config.get('model_path'))
     
     # Job tracker to monitor when all segments for a job are received
     # Format: {job_id: {'total': int, 'received': set()}}
@@ -314,8 +278,8 @@ async def main(config):
                 async with queue.iterator() as queue_iter:
                     async for message in queue_iter:
                         try:
-                            await process_message(message, model, tokenizer, job_tracker)
-                        except (aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed) as channel_err:
+                            await process_message(message, model, tokenizer, model_type, job_tracker)
+                        except (ChannelInvalidStateError, ChannelClosed) as channel_err:
                             print(f"Channel error during message processing: {channel_err}")
                             print("Will attempt to reconnect...")
                             # Break out of the message loop to reconnect
@@ -326,7 +290,7 @@ async def main(config):
                             traceback.print_exc()
                             # Continue processing other messages
                             
-        except (aio_pika.AMQPError, aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed, ConnectionError) as conn_error:
+        except (AMQPError, ChannelInvalidStateError, ChannelClosed, ConnectionError) as conn_error:
             retry_count += 1
             if retry_count > max_retries:
                 print(f"Max retries ({max_retries}) exceeded. Giving up.")

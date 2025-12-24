@@ -28,83 +28,12 @@ import os
 from aio_pika.abc import AbstractIncomingMessage
 from pamqp.commands import Basic
 
-from utils import load_config, create_ssl_context
+from utils import load_config, create_ssl_context, load_quantized_llm_model, quantized_generate_from_prompt
 
 # Device detection - prioritize CUDA over MPS
 device = "cuda" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "cpu"
 model_type = None
 print(f"Detected device: {device}")
-
-
-def load_llm_model(model_path: str = None):
-    """
-    Load the LLM model for speaker identification.
-    
-    Supports different hardware backends:
-    - MPS (Apple Metal): Uses MLX library for optimal performance
-    - CUDA (NVIDIA): Uses llama-cpp-python for GPU acceleration
-    - CPU: Not optimized for quantized models
-    
-    Args:
-        model_path: Path to the model (optional, uses default if not provided)
-    
-    Returns:
-        tuple: (model, tokenizer) - tokenizer may be None for llama-cpp
-    """
-    global model_type
-    
-    if device == "mps":
-        # Import MLX libraries for Apple MPS hardware
-        try:
-            import mlx.core as mx
-            from mlx_lm import load
-            print("Loading MLX model for MPS device...")
-            model_name = model_path or "./Qwen3-32B-MLX-4bit"
-            model, tokenizer = load(model_name)
-            model_type = "mlx"
-            print(f"Successfully loaded MLX model: {model_name}")
-            return model, tokenizer
-        except ImportError:
-            print("MLX libraries not available. Install mlx-lm for MPS support.")
-            raise
-        except Exception as e:
-            print(f"Error loading MLX model: {e}")
-            raise
-
-    elif device == "cuda":
-        # Import llama-cpp-python for NVIDIA CUDA hardware
-        try:
-            from llama_cpp import Llama
-            print("Loading GGUF model for CUDA device...")
-            model_path = model_path or "./Qwen3-32B-Q4_K_M.gguf"
-            
-            # Temporarily suppress llama.cpp warnings
-            os.environ['LLAMA_LOG_DISABLE'] = '1'
-            
-            model = Llama(
-                model_path=model_path,
-                n_gpu_layers=-1,  # Use all GPU layers
-                n_ctx=8192,  # Context window size
-                verbose=False
-            )
-            
-            # Re-enable logging after model load
-            if 'LLAMA_LOG_DISABLE' in os.environ:
-                del os.environ['LLAMA_LOG_DISABLE']
-            
-            model_type = "llamacpp"
-            print(f"Successfully loaded GGUF model: {model_path}")
-            return model, None  # llama-cpp handles tokenization internally
-        except ImportError:
-            print("llama-cpp-python not available. Install llama-cpp-python for CUDA support.")
-            raise
-        except Exception as e:
-            print(f"Error loading GGUF model: {e}")
-            raise
-
-    else:
-        print("CPU inference not optimized for quantized models. Please use an MPS or CUDA device.")
-        raise RuntimeError("Unsupported device: CPU")
 
 
 def parse_llm_json_output(raw_output: str) -> dict:
@@ -210,69 +139,6 @@ def parse_llm_json_output(raw_output: str) -> dict:
     return best_result
 
 
-def generate_from_prompt(prompt: str, model, tokenizer) -> str:
-    """
-    Generate text from a prompt using the appropriate backend.
-    
-    Handles both MLX and llama-cpp model types with their respective APIs.
-    
-    Args:
-        prompt: The input prompt
-        model: The loaded model
-        tokenizer: The tokenizer (None for llama-cpp)
-    
-    Returns:
-        str: The generated text
-    """
-    if model_type == "mlx":
-        # MLX generation using the correct API
-        try:
-            from mlx_lm import generate
-            from mlx_lm.sample_utils import make_sampler
-            response = generate(
-                model,
-                tokenizer,
-                prompt=prompt,
-                max_tokens=3000,
-                verbose=False,
-                sampler=make_sampler(
-                    temp=0.7,
-                    top_p=0.9,
-                    top_k=40,
-                    min_p=0.0,
-                    min_tokens_to_keep=1,
-                    xtc_probability=0.0,
-                    xtc_threshold=0.0
-                ),
-                max_kv_size=32768,
-            )
-            return response.strip()
-        except Exception as e:
-            print(f"MLX generation error: {e}")
-            return ""
-
-    elif model_type == "llamacpp":
-        # llama-cpp-python generation
-        try:
-            response = model(
-                prompt,
-                max_tokens=3000,
-                temperature=0.7,
-                top_p=0.9,
-                top_k=40,
-                repeat_penalty=1.0,
-                echo=False
-            )
-            return response['choices'][0]['text'].strip()
-        except Exception as e:
-            print(f"GGUF generation error: {e}")
-            return ""
-
-    else:
-        print(f"Unknown model type: {model_type}")
-        return ""
-
-
 def identify_speakers(transcript_window: str, model, tokenizer) -> dict:
     """
     Identify speakers from a transcript window using LLM.
@@ -328,7 +194,7 @@ Transcript:
     
     try:
         # Use backend-specific generation
-        generated_text = generate_from_prompt(prompt, model, tokenizer)
+        generated_text = quantized_generate_from_prompt(prompt, model, tokenizer, model_type)
         
         if not generated_text:
             return {}
@@ -470,7 +336,8 @@ async def main(config):
     # Load model once at startup
     print("Loading LLM model...")
     model_path = config.get('model_path')
-    model, tokenizer = load_llm_model(model_path)
+    global model_type
+    model, tokenizer, model_type = load_quantized_llm_model(device, model_path)
     
     ssl_context = create_ssl_context()
     
