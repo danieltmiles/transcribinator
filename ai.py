@@ -15,6 +15,7 @@ from typing import Any
 import anyio
 import aio_pika
 import torch
+from aiormq import ChannelInvalidStateError, ChannelClosed, AMQPError
 from numpy import ndarray
 
 from shared_disks import WebDavRemoteStorage
@@ -332,16 +333,16 @@ async def send_diarization_job_to_queue(audio_file_path: str, rabbitmq_config: d
                                     error = response.get('error', 'Unknown error')
                                     raise RuntimeError(f"Diarization job failed: {error}")
                                 break
-                    except (aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed) as channel_error:
+                    except (ChannelInvalidStateError, ChannelClosed) as channel_error:
                         print(f"Channel error while waiting for diarization response: {channel_error}")
                         raise
             
             # Delete the reply-to queue now that we're done consuming
             try:
                 await channel.queue_delete(response_queue)
-            except (aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed):
+            except (ChannelInvalidStateError, ChannelClosed):
                 print("Could not delete response queue due to channel error")
-    except (aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed, aio_pika.AMQPError) as e:
+    except (ChannelInvalidStateError, ChannelClosed, AMQPError) as e:
         print(f"RabbitMQ connection error in diarization: {e}")
         raise
     
@@ -370,14 +371,56 @@ async def send_whisper_jobs(
     work_queue = "whisper/large"
     response_queue = f"{work_queue}-{uuid.uuid4()}"
     signal, sr = normalize_audio(audio_file_path)
-    segments_list = list(diarized_segment_iter(signal, diarization, sr))
+    
+    # Get all segments from diarization
+    raw_segments_list = list(diarized_segment_iter(signal, diarization, sr))
+    
+    # Consolidate consecutive segments with the same speaker BEFORE sending to whisper
+    consolidated_segments = []
+    current_speaker = None
+    accumulated_audio = []
+    accumulated_start = None
+    accumulated_end = None
+    
+    for segment in raw_segments_list:
+        speaker = segment['speaker']
+        
+        if current_speaker != speaker:
+            # Different speaker - save accumulated segment if exists
+            if accumulated_audio:
+                import numpy as np
+                consolidated_segments.append({
+                    'audio': np.concatenate(accumulated_audio),
+                    'start': accumulated_start,
+                    'end': accumulated_end,
+                    'speaker': current_speaker,
+                })
+            
+            # Start new accumulation
+            accumulated_audio = [segment['audio']]
+            accumulated_start = segment['start']
+            accumulated_end = segment['end']
+            current_speaker = speaker
+        else:
+            # Same speaker - accumulate audio
+            accumulated_audio.append(segment['audio'])
+            accumulated_end = segment['end']
+    
+    # Don't forget the last accumulated segment
+    if accumulated_audio:
+        import numpy as np
+        consolidated_segments.append({
+            'audio': np.concatenate(accumulated_audio),
+            'start': accumulated_start,
+            'end': accumulated_end,
+            'speaker': current_speaker,
+        })
+    
+    segments_list = consolidated_segments
     job_id = str(uuid.uuid4())
     received_segments = []
     total_segments = len(segments_list)
     out_of_order_responses = []
-
-    current_speaker = None
-    accumulated_segment = None
     
     # Connect to RabbitMQ
     ssl_context = create_ssl_context()
@@ -448,15 +491,16 @@ async def send_whisper_jobs(
                         print(f"length of out of order segments: {len(out_of_order_responses)}")
                         continue
 
-                    print(f"before process segment, current speaker is {current_speaker}, speaker in msg is {response.get('speaker')}")
-                    accumulated_segment, current_speaker = await process_segment(
-                        accumulated_segment,
-                        current_speaker,
-                        response,
-                        segment_count,
-                        segment_stream_send,
-                    )
-                    print(f"after process segment, current speaker is {current_speaker}, speaker in msg is {response.get('speaker')}")
+                    # Process segment directly - no need to consolidate since we did it before whisper
+                    segment_to_send = {
+                        'speaker': response["speaker"],
+                        'start': response.get("audio_segment", {}).get("start", -1.0),
+                        'end': response.get("audio_segment", {}).get("end", -1.0),
+                        'text': get_text_from_segment(response),
+                        'segment_count': segment_count,
+                        'subsegment_numbers': [segment_count],
+                    }
+                    await segment_stream_send.send(segment_to_send)
 
                     # reconcile any out-of-order segments
                     out_of_order_responses = sorted(out_of_order_responses,
@@ -466,15 +510,16 @@ async def send_whisper_jobs(
                         out_of_order_segment_number = out_of_order_response["segment_count"]
                         if out_of_order_segment_number == received_segments[-1] + 1:
                             received_segments.append(out_of_order_segment_number)
-                            print(f"before reconcile segment, current speaker is {current_speaker}, speaker in msg is {response.get('speaker')}")
-                            accumulated_segment, current_speaker = await process_segment(
-                                accumulated_segment,
-                                current_speaker,
-                                out_of_order_response,
-                                out_of_order_segment_number,
-                                segment_stream_send,
-                            )
-                            print(f"after reconcile segment, current speaker is {current_speaker}, speaker in msg is {response.get('speaker')}")
+                            # Process out of order segment
+                            out_of_order_segment_to_send = {
+                                'speaker': out_of_order_response["speaker"],
+                                'start': out_of_order_response.get("audio_segment", {}).get("start", -1.0),
+                                'end': out_of_order_response.get("audio_segment", {}).get("end", -1.0),
+                                'text': get_text_from_segment(out_of_order_response),
+                                'segment_count': out_of_order_segment_number,
+                                'subsegment_numbers': [out_of_order_segment_number],
+                            }
+                            await segment_stream_send.send(out_of_order_segment_to_send)
                         else:
                             print(f"unable to reconcile segment {out_of_order_segment_number}, saving for later")
                             unreconciled_out_of_order_segments.append(out_of_order_response)
@@ -483,9 +528,6 @@ async def send_whisper_jobs(
                     # Stop when all segments received
                     if len(received_segments) == total_segments:
                         print(f"Received all {total_segments} segments")
-                        # send the last accumulated segment
-                        if accumulated_segment is not None:
-                            await segment_stream_send.send(accumulated_segment)
                         await segment_stream_send.aclose()
                         break
         

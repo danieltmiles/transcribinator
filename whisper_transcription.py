@@ -6,6 +6,7 @@ import torch
 import time
 import asyncio
 
+from aiormq import ChannelInvalidStateError, ChannelClosed, AMQPError
 from pamqp.commands import Basic
 
 from utils import load_config, create_ssl_context
@@ -166,7 +167,7 @@ async def process_message(message: aio_pika.IncomingMessage, whisper_model):
                     delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
                 ),
             )
-        except (aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed) as channel_error:
+        except (ChannelInvalidStateError, ChannelClosed) as channel_error:
             print(f"Channel error while sending response for job {job_id}: {channel_error}")
             print(f"Message will be re-queued for retry")
             # Nack the message so it gets requeued
@@ -204,7 +205,7 @@ async def process_message(message: aio_pika.IncomingMessage, whisper_model):
                         ),
                         routing_key=reply_to,
                     )
-                except (aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed):
+                except (ChannelInvalidStateError, ChannelClosed):
                     print(f"Could not send error response due to channel error - message will be requeued")
         except Exception as error_e:
             print(f"Error sending error response: {error_e}")
@@ -274,7 +275,7 @@ async def main(config):
                     async for message in queue_iter:
                         try:
                             await process_message(message, whisper_model)
-                        except (aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed) as channel_err:
+                        except (ChannelInvalidStateError, ChannelClosed) as channel_err:
                             print(f"Channel error during message processing: {channel_err}")
                             print("Will attempt to reconnect...")
                             # Break out of the message loop to reconnect
@@ -285,7 +286,7 @@ async def main(config):
                             traceback.print_exc()
                             # Continue processing other messages
                             
-        except (aio_pika.AMQPError, aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed, ConnectionError) as conn_error:
+        except (AMQPError, ChannelInvalidStateError, ChannelClosed, ConnectionError) as conn_error:
             retry_count += 1
             if retry_count > max_retries:
                 print(f"Max retries ({max_retries}) exceeded. Giving up.")

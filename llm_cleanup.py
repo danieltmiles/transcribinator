@@ -170,7 +170,7 @@ async def process_message(message: AbstractIncomingMessage, model, tokenizer, mo
                     delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
                 ),
             )
-        except (aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed) as channel_error:
+        except (ChannelInvalidStateError, ChannelClosed) as channel_error:
             print(f"Channel error while sending response for job {job_id}: {channel_error}")
             print(f"Message will be re-queued for retry")
             # Nack the message so it gets requeued
@@ -210,7 +210,7 @@ async def process_message(message: AbstractIncomingMessage, model, tokenizer, mo
                         ),
                         routing_key=reply_to,
                     )
-                except (aio_pika.ChannelInvalidStateError, aio_pika.ChannelClosed):
+                except (ChannelInvalidStateError, ChannelClosed):
                     print(f"Could not send error response due to channel error - message will be requeued")
         except Exception as error_e:
             print(f"Error sending error response: {error_e}")
