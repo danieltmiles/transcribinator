@@ -194,7 +194,7 @@ def clean_overlapping_text(text_list):
     return [text for text in cleaned if text.strip()]
 
 def format_timestamp(seconds):
-    seconds = int(seconds)
+    seconds = round(seconds)  # Round to nearest second instead of truncating
     one_hour = 60 * 60
     one_minute = 60
     hours = int(seconds / one_hour)
@@ -416,11 +416,57 @@ async def send_whisper_jobs(
             'speaker': current_speaker,
         })
     
-    segments_list = consolidated_segments
+    # Split large consolidated segments to avoid RabbitMQ size limits (128MB)
+    # JSON encoding creates significant overhead: each float32 becomes ~10 chars in JSON
+    # To stay under 128MB, limit to ~3M samples: 3M * 10 chars * 1 byte = 30MB audio data
+    # Plus message overhead leaves comfortable margin under 128MB limit
+    MAX_AUDIO_SAMPLES = 3_000_000  # ~30MB of JSON-encoded audio data, ~100MB total message
+    MIN_SEGMENT_DURATION = 0.5  # Minimum segment duration in seconds (half a second)
+    
+    segments_list = []
+    for segment in consolidated_segments:
+        # Skip segments that are less than half a second long
+        segment_duration = segment['end'] - segment['start']
+        if segment_duration < MIN_SEGMENT_DURATION:
+            print(f"Skipping short segment ({segment_duration:.3f}s) for speaker {segment['speaker']}")
+            continue
+        
+        audio_data = segment['audio']
+        if len(audio_data) <= MAX_AUDIO_SAMPLES:
+            # Segment is small enough, add as-is
+            segments_list.append(segment)
+        else:
+            # Split large segment into chunks
+            print(f"Splitting large segment ({len(audio_data)} samples) for speaker {segment['speaker']}")
+            num_chunks = (len(audio_data) + MAX_AUDIO_SAMPLES - 1) // MAX_AUDIO_SAMPLES
+            chunk_size = len(audio_data) // num_chunks
+            
+            for i in range(num_chunks):
+                chunk_start_idx = i * chunk_size
+                chunk_end_idx = min((i + 1) * chunk_size, len(audio_data))
+                chunk_audio = audio_data[chunk_start_idx:chunk_end_idx]
+                
+                # Calculate time offsets for this chunk
+                chunk_duration = len(chunk_audio) / sr
+                chunk_start_time = segment['start'] + (chunk_start_idx / sr)
+                chunk_end_time = chunk_start_time + chunk_duration
+                
+                segments_list.append({
+                    'audio': chunk_audio,
+                    'start': chunk_start_time,
+                    'end': chunk_end_time,
+                    'speaker': segment['speaker'],
+                })
+                print(f"  Created chunk {i+1}/{num_chunks}: {len(chunk_audio)} samples")
+    
     job_id = str(uuid.uuid4())
     received_segments = []
     total_segments = len(segments_list)
     out_of_order_responses = []
+    
+    # Track accumulation state for merging segments from same speaker
+    current_speaker = None
+    accumulated_segment = None
     
     # Connect to RabbitMQ
     ssl_context = create_ssl_context()
@@ -491,16 +537,16 @@ async def send_whisper_jobs(
                         print(f"length of out of order segments: {len(out_of_order_responses)}")
                         continue
 
-                    # Process segment directly - no need to consolidate since we did it before whisper
-                    segment_to_send = {
-                        'speaker': response["speaker"],
-                        'start': response.get("audio_segment", {}).get("start", -1.0),
-                        'end': response.get("audio_segment", {}).get("end", -1.0),
-                        'text': get_text_from_segment(response),
-                        'segment_count': segment_count,
-                        'subsegment_numbers': [segment_count],
-                    }
-                    await segment_stream_send.send(segment_to_send)
+                    # Process segment with accumulation to merge splits from same speaker
+                    print(f"before process segment, current speaker is {current_speaker}, speaker in msg is {response.get('speaker')}")
+                    accumulated_segment, current_speaker = await process_segment(
+                        accumulated_segment,
+                        current_speaker,
+                        response,
+                        segment_count,
+                        segment_stream_send,
+                    )
+                    print(f"after process segment, current speaker is {current_speaker}, speaker in msg is {response.get('speaker')}")
 
                     # reconcile any out-of-order segments
                     out_of_order_responses = sorted(out_of_order_responses,
@@ -510,16 +556,15 @@ async def send_whisper_jobs(
                         out_of_order_segment_number = out_of_order_response["segment_count"]
                         if out_of_order_segment_number == received_segments[-1] + 1:
                             received_segments.append(out_of_order_segment_number)
-                            # Process out of order segment
-                            out_of_order_segment_to_send = {
-                                'speaker': out_of_order_response["speaker"],
-                                'start': out_of_order_response.get("audio_segment", {}).get("start", -1.0),
-                                'end': out_of_order_response.get("audio_segment", {}).get("end", -1.0),
-                                'text': get_text_from_segment(out_of_order_response),
-                                'segment_count': out_of_order_segment_number,
-                                'subsegment_numbers': [out_of_order_segment_number],
-                            }
-                            await segment_stream_send.send(out_of_order_segment_to_send)
+                            print(f"before reconcile segment, current speaker is {current_speaker}, speaker in msg is {out_of_order_response.get('speaker')}")
+                            accumulated_segment, current_speaker = await process_segment(
+                                accumulated_segment,
+                                current_speaker,
+                                out_of_order_response,
+                                out_of_order_segment_number,
+                                segment_stream_send,
+                            )
+                            print(f"after reconcile segment, current speaker is {current_speaker}, speaker in msg is {out_of_order_response.get('speaker')}")
                         else:
                             print(f"unable to reconcile segment {out_of_order_segment_number}, saving for later")
                             unreconciled_out_of_order_segments.append(out_of_order_response)
@@ -528,6 +573,9 @@ async def send_whisper_jobs(
                     # Stop when all segments received
                     if len(received_segments) == total_segments:
                         print(f"Received all {total_segments} segments")
+                        # Send the last accumulated segment
+                        if accumulated_segment is not None:
+                            await segment_stream_send.send(accumulated_segment)
                         await segment_stream_send.aclose()
                         break
         
@@ -547,6 +595,11 @@ async def process_segment(
     speaker = response["speaker"]
     print(f"processing whisper segment from {speaker=}")
     text = get_text_from_segment(response)
+    
+    # Discard empty text segments - don't pass them to the next pipeline stage
+    if not text or not text.strip():
+        print(f"Discarding empty text segment from {speaker=}")
+        return accumulated_segment, current_speaker
 
     if current_speaker != speaker:
         print(f"speaker change! {current_speaker=}, {speaker=}")
@@ -1442,7 +1495,9 @@ def save_transcript(transcript, output_file):
     """Save the transcript to a file"""
     with open(output_file, 'w', encoding='utf-8') as f:
         for entry in transcript:
-            f.write(f"[{entry['start']} - {entry['end']}] {entry['speaker']}:\n")
+            start_ts = format_timestamp(entry['start'])
+            end_ts = format_timestamp(entry['end'])
+            f.write(f"[{start_ts} - {end_ts}] {entry['speaker']}:\n")
             f.write(f"{entry['text']}\n\n")
 
 
@@ -1450,7 +1505,9 @@ def produce_transcript(transcript) -> str:
     """Save the transcript to a file"""
     f = StringIO()
     for entry in transcript:
-        f.write(f"[{entry['start']} - {entry['end']}] {entry['speaker']}:\n")
+        start_ts = format_timestamp(entry['start'])
+        end_ts = format_timestamp(entry['end'])
+        f.write(f"[{start_ts} - {end_ts}] {entry['speaker']}:\n")
         f.write(f"{entry['text']}\n\n")
     return f.getvalue()
 
