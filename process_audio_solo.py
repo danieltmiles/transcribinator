@@ -1,11 +1,19 @@
 import asyncio
+import functools
+import os.path
 from pathlib import Path
+from typing import Callable
 
 import anyio
 from anyio import create_memory_object_stream
 from anyio.streams.memory import MemoryObjectSendStream
 
 from ai import process_audio
+
+
+def derive_transcript_filename(audio_file_path):
+    return Path(audio_file_path).stem + "_transcript.txt"
+
 
 async def make_transcript(audio_file_path: str, result_send: MemoryObjectSendStream) -> str:
     print(f"make transcript for {audio_file_path}")
@@ -46,7 +54,11 @@ async def make_transcript(audio_file_path: str, result_send: MemoryObjectSendStr
 
 async def limited_worker(semaphore, work_func, *args, **kwargs):
     async with semaphore:
-        return await work_func(*args, **kwargs)
+        try:
+            return await work_func(*args, **kwargs)
+        except Exception as exp:
+            print(f"caught exception in worker:\n{exp}")
+            raise
 
 async def main():
     # Find all audio files in the target directory
@@ -66,13 +78,17 @@ async def main():
             print("waiting for result_receive")
             async for audio_file_path, transcript_text in result_receive:
                 # Create output filename based on input filename
-                output_filename = Path(audio_file_path).stem + "_transcript.txt"
+                output_filename = derive_transcript_filename(audio_file_path)
                 print(f"saving transcript for {audio_file_path} to {output_filename}")
                 with open(output_filename, "w") as fl:
                     fl.write(transcript_text)
     async with anyio.create_task_group() as tg:
         tg.start_soon(save_transcript, result_receive)
         for audio_file in audio_files:
+            # skip work that's already done
+            would_be_transcript_filename = derive_transcript_filename(audio_file)
+            if os.path.exists(would_be_transcript_filename):
+                continue
             # Start whisper jobs - will stream results to segment_send_stream
             tg.start_soon(
                 limited_worker,

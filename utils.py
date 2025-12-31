@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import ssl
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -180,7 +181,7 @@ def load_quantized_llm_model(device: str, model_path: str = None):
     Returns:
         tuple: (model, tokenizer) - tokenizer may be None for llama-cpp
     """
-    if device == "mps":
+    if device == "mps" and "MLX" in model_path:
         # Import MLX libraries for Apple MPS hardware
         try:
             import mlx.core as mx
@@ -198,7 +199,7 @@ def load_quantized_llm_model(device: str, model_path: str = None):
             print(f"Error loading MLX model: {e}")
             raise
 
-    elif device == "cuda":
+    elif device == "cuda" or (device == "mps" and "GGUF" in model_path):
         # Import llama-cpp-python for NVIDIA CUDA hardware
         try:
             from llama_cpp import Llama
@@ -211,7 +212,8 @@ def load_quantized_llm_model(device: str, model_path: str = None):
             model = Llama(
                 model_path=model_path,
                 n_gpu_layers=-1,  # Use all GPU layers
-                n_ctx=8192,  # Context window size
+                # n_ctx=8192,  # Context window size
+                n_ctx=65536,  # Context window size
                 verbose=False
             )
 
@@ -234,61 +236,112 @@ def load_quantized_llm_model(device: str, model_path: str = None):
         raise RuntimeError("Unsupported device: CPU")
 
 
-def quantized_generate_from_prompt(prompt: str, model, tokenizer, model_type) -> str:
+def quantized_generate_from_prompt(prompt: str, model, tokenizer, model_type, max_tokens: int = 8192) -> str:
     """
     Generate text from a prompt using the appropriate backend.
 
     Handles both MLX and llama-cpp model types with their respective APIs.
+    For MLX, uses stream_generate and stops naturally on EOS token.
 
     Args:
         prompt: The input prompt
         model: The loaded model
         tokenizer: The tokenizer (None for llama-cpp)
+        max_tokens: Maximum number of tokens to generate (default: 8192, acts as safety limit)
 
     Returns:
         str: The generated text
     """
     if model_type == "mlx":
-        # MLX generation using the correct API
+        # MLX streaming generation - stops naturally on EOS token
         try:
-            from mlx_lm import generate
+            from mlx_lm import stream_generate
             from mlx_lm.sample_utils import make_sampler
-            response = generate(
+
+            # Get EOS token ID from tokenizer
+            eos_token_id = tokenizer.eos_token_id
+
+            # Accumulate the generated text
+            generated_text = ""
+
+            print("Generating response (streaming until EOS token)...")
+            start = time.time()
+            for token_info in stream_generate(
                 model,
                 tokenizer,
                 prompt=prompt,
-                verbose=False,
+                max_tokens=max_tokens,  # Acts as safety limit
                 sampler=make_sampler(
-                    temp=0.3,
-                    top_p=0.9,
-                    top_k=40,
-                    min_p=0.0,
-                    min_tokens_to_keep=1,
-                    xtc_probability=0.0,
-                    xtc_threshold=0.0
+                    temp=0.7,
+                    # top_p=0.9,
+                    # top_k=40,
+                    # min_p=0.0,
+                    # min_tokens_to_keep=1,
+                    # xtc_probability=0.0,
+                    # xtc_threshold=0.0
                 ),
                 max_kv_size=32768,
-            )
-            return response.strip()
+            ):
+                if token_info.generation_tokens == 1:
+                    print(f"time to first token: {time.time() - start}")
+                # stream_generate yields GenerationResponse objects
+                token_text = token_info.text
+                generated_text += token_text
+
+                # Check if we hit EOS token
+                if token_info.token == eos_token_id:
+                    print(f"EOS token detected, stopping generation. Generated {token_info.generation_tokens} tokens, {token_info.generation_tps} per second")
+                    break
+
+            end = time.time()
+            print(f"generated response in {end - start}")
+            return generated_text.strip()
         except Exception as e:
             print(f"MLX generation error: {e}")
+            import traceback
+            traceback.print_exc()
             return ""
 
     elif model_type == "llamacpp":
-        # llama-cpp-python generation
+        # llama-cpp-python streaming generation - stops naturally on EOS token
         try:
-            response = model(
+            print("Generating response (streaming until EOS token)...")
+            generated_text = ""
+
+            # Stream the response with stream=True
+            stream = model(
                 prompt,
-                max_tokens=3000,
+                max_tokens=max_tokens,  # Acts as safety limit
                 temperature=0.7,
                 top_p=0.9,
                 top_k=40,
                 repeat_penalty=1.0,
-                echo=False
+                echo=False,
+                stream=True  # Enable streaming
             )
-            return response['choices'][0]['text'].strip()
+
+            # Accumulate tokens from the stream
+            for chunk in stream:
+                # Each chunk has the structure: {'choices': [{'text': '...', 'finish_reason': ...}]}
+                if 'choices' in chunk and len(chunk['choices']) > 0:
+                    choice = chunk['choices'][0]
+                    token_text = choice.get('text', '')
+                    generated_text += token_text
+
+                    # Check for finish reason (None, 'stop', 'length')
+                    finish_reason = choice.get('finish_reason', None)
+                    if finish_reason == 'stop':
+                        print("EOS token detected, stopping generation.")
+                        break
+                    elif finish_reason == 'length':
+                        print("Max tokens reached.")
+                        break
+
+            return generated_text.strip()
         except Exception as e:
             print(f"GGUF generation error: {e}")
+            import traceback
+            traceback.print_exc()
             return ""
 
     else:
