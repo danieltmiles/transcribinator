@@ -56,8 +56,9 @@ def quantized_generate_from_messages(messages: list, model, tokenizer, model_typ
 def main():
     model, tokenizer, model_type = load_quantized_llm_model(
         device,
-        "/Users/dmiles/.lmstudio/models/lmstudio-community/Olmo-3-32B-Think-MLX-4bit",
-        #"/Users/dmiles/.lmstudio/models/lmstudio-community/Olmo-3-32B-Think-GGUF/Olmo-3-32B-Think-Q4_K_M.gguf",
+        #"/Users/dmiles/.lmstudio/models/lmstudio-community/gpt-oss-20b-GGUF",
+        #"/Users/dmiles/.lmstudio/models/lmstudio-community/Olmo-3-32B-Think-MLX-4bit",
+        "/Users/dmiles/.lmstudio/models/lmstudio-community/Olmo-3-32B-Think-GGUF/Olmo-3-32B-Think-Q4_K_M.gguf",
         # "/Users/dmiles/.lmstudio/models/lmstudio-community/Qwen3-32B-GGUF",
     )
     # Read transcript once
@@ -110,39 +111,41 @@ def main():
                 "content": "You are a political analyst helping to extract information from city council meeting transcripts."
             })
 
-            # First user message establishes the transcript as context
-            conversation.append({
-                "role": "user",
-                "content": f"""I'm going to provide you with a city council meeting transcript. Please read it carefully as I'll be asking you questions about it.
-
-```transcript
-{transcript_segment}
-```
-
-Please confirm you've read the transcript and are ready to analyze it."""
-            })
-
-            # Get confirmation (optional, but helps establish context)
-            print("reading transcript")
-            confirmation = quantized_generate_from_messages(conversation, model, tokenizer, model_type)
-            #print("Assistant confirmation:", confirmation[:200], "...\n")
-
-            # Add assistant's response to conversation history
-            conversation.append({
-                "role": "assistant",
-                "content": confirmation
-            })
+#             # First user message establishes the transcript as context
+#             conversation.append({
+#                 "role": "user",
+#                 "content": f"""I'm going to provide you with a city council meeting transcript. Please read it carefully as I'll be asking you questions about it.
+#
+# ```transcript
+# {transcript_segment}
+# ```
+#
+# Please confirm you've read the transcript and are ready to analyze it."""
+#             })
+#
+#             # Get confirmation (optional, but helps establish context)
+#             print("reading transcript")
+#             confirmation = quantized_generate_from_messages(conversation, model, tokenizer, model_type)
+#             #print("Assistant confirmation:", confirmation[:200], "...\n")
+#
+#             # Add assistant's response to conversation history
+#             conversation.append({
+#                 "role": "assistant",
+#                 "content": confirmation
+#             })
 
             # Now ask for the political issues analysis
             conversation.append({
                 "role": "user",
-                "content": """Now, please determine all political issues being discussed in the transcript. 
-Format your response in a text block starting with ```graph.
-contents of the graph block should look like this:
-| Person -> Supports/Opposes -> Issue |
+                "content": """Extract all political issues as relationships in this exact format:
+```graph
+| Speaker -> Position -> Issue |
+```
 
-For example:
-| Mayor Hales -> Supports -> Tenant Protections |
+Rules:
+- One relationship per line
+- No additional explanation
+- Maximum 15 relationships
 """
             })
 
@@ -158,6 +161,7 @@ For example:
                     print(answer)
                 except IndexError:
                     # try again
+                    print(f"failed to find ```graph block in generated text:\n{generated}")
                     answer_tries -= 1
                     continue
                 break
@@ -184,9 +188,6 @@ For example:
                 seen_topics.add(topic)
                 print(f"{entity=} {relationship=} {topic=}")
 
-                # EFFICIENT APPROACH: Use temporary concatenation instead of appending
-                # This keeps context constant size rather than growing with each topic
-                # Since each topic description is independent, we don't need previous descriptions
                 tries_left = 3
                 description = ""
                 while tries_left > 0:
@@ -194,8 +195,11 @@ For example:
                         base_conversation + [{
                             "role": "user",
                             "content": f"""You identified the topic "{topic}" from the transcript.
-Please create a     detailed description of this topic based on the information in the transcript.
-Write your descr    iption in a text block starting with ```description"""
+Please create a detailed description of this topic based on the information in the transcript in this exact format:.
+```description
+description goes here
+```
+"""
                         }],
                         model, tokenizer, model_type
                     )
@@ -204,9 +208,9 @@ Write your descr    iption in a text block starting with ```description"""
                     except IndexError:
                         tries_left -= 1
                         continue
-                    if not description:
-                        raise ValueError("could not generate description in 3 tries")
-                    print(description)
+                if not description:
+                    raise ValueError("could not generate description in 3 tries")
+                print(description)
 
                 # Note: We're NOT appending to conversation here because each topic
                 # description is independent and doesn't need to see other topics
