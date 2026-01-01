@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 import json
 import ssl
@@ -11,6 +12,7 @@ import torchaudio
 from pydub import AudioSegment
 from starlette.websockets import WebSocket
 from torch import Tensor
+from transformers import AutoTokenizer
 
 
 @dataclass
@@ -203,7 +205,7 @@ def load_quantized_llm_model(device: str, model_path: str = None):
         # Import llama-cpp-python for NVIDIA CUDA hardware
         try:
             from llama_cpp import Llama
-            print("Loading GGUF model for CUDA device...")
+            print(f"Loading GGUF model for {device} device...")
             model_path = model_path or "./Qwen3-32B-Q4_K_M.gguf"
 
             # Temporarily suppress llama.cpp warnings
@@ -212,10 +214,10 @@ def load_quantized_llm_model(device: str, model_path: str = None):
             model = Llama(
                 model_path=model_path,
                 n_gpu_layers=-1,  # Use all GPU layers
-                # n_ctx=8192,  # Context window size
-                n_ctx=65536,  # Context window size
+                n_ctx=8192,  # Context window size
                 verbose=False
             )
+            tokenizer = AutoTokenizer.from_pretrained("allenai/Olmo-3-32B-Think")
 
             # Re-enable logging after model load
             if 'LLAMA_LOG_DISABLE' in os.environ:
@@ -223,7 +225,7 @@ def load_quantized_llm_model(device: str, model_path: str = None):
 
             model_type = "llamacpp"
             print(f"Successfully loaded GGUF model: {model_path}")
-            return model, None, model_type  # llama-cpp handles tokenization internally
+            return model, tokenizer, model_type  # llama-cpp handles tokenization internally
         except ImportError:
             print("llama-cpp-python not available. Install llama-cpp-python for CUDA support.")
             raise
@@ -236,7 +238,7 @@ def load_quantized_llm_model(device: str, model_path: str = None):
         raise RuntimeError("Unsupported device: CPU")
 
 
-def quantized_generate_from_prompt(prompt: str, model, tokenizer, model_type, max_tokens: int = 8192) -> str:
+def quantized_generate_from_prompt(prompt: str, model, tokenizer, model_type, max_tokens: int = 12288) -> str:
     """
     Generate text from a prompt using the appropriate backend.
 
@@ -264,8 +266,6 @@ def quantized_generate_from_prompt(prompt: str, model, tokenizer, model_type, ma
             # Accumulate the generated text
             generated_text = ""
 
-            print("Generating response (streaming until EOS token)...")
-            start = time.time()
             for token_info in stream_generate(
                 model,
                 tokenizer,
@@ -282,19 +282,14 @@ def quantized_generate_from_prompt(prompt: str, model, tokenizer, model_type, ma
                 ),
                 max_kv_size=32768,
             ):
-                if token_info.generation_tokens == 1:
-                    print(f"time to first token: {time.time() - start}")
                 # stream_generate yields GenerationResponse objects
-                token_text = token_info.text
-                generated_text += token_text
+                generated_text += token_info.text
 
                 # Check if we hit EOS token
                 if token_info.token == eos_token_id:
                     print(f"EOS token detected, stopping generation. Generated {token_info.generation_tokens} tokens, {token_info.generation_tps} per second")
                     break
 
-            end = time.time()
-            print(f"generated response in {end - start}")
             return generated_text.strip()
         except Exception as e:
             print(f"MLX generation error: {e}")
@@ -312,10 +307,10 @@ def quantized_generate_from_prompt(prompt: str, model, tokenizer, model_type, ma
             stream = model(
                 prompt,
                 max_tokens=max_tokens,  # Acts as safety limit
-                temperature=0.7,
-                top_p=0.9,
-                top_k=40,
-                repeat_penalty=1.0,
+                temperature=0.5,
+                # top_p=0.9,
+                # top_k=40,
+                repeat_penalty=1.1,
                 echo=False,
                 stream=True  # Enable streaming
             )

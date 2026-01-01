@@ -35,6 +35,8 @@ def quantized_generate_from_messages(messages: list, model, tokenizer, model_typ
             tokenize=False, 
             add_generation_prompt=True
         )
+    elif hasattr(model, "create_chat_completion"):
+        return model.create_chat_completion(messages)
     else:
         # Fallback: manually format as simple conversation
         prompt = ""
@@ -52,111 +54,165 @@ def quantized_generate_from_messages(messages: list, model, tokenizer, model_typ
     return quantized_generate_from_prompt(prompt, model, tokenizer, model_type, **kwargs)
 
 def main():
-    try:
-        model, tokenizer, model_type = load_quantized_llm_model(
-            device,
-            # "/Users/dmiles/.lmstudio/models/lmstudio-community/Olmo-3-32B-Think-MLX-4bit",
-            "/Users/dmiles/.lmstudio/models/lmstudio-community/Olmo-3-32B-Think-GGUF/Olmo-3-32B-Think-Q4_K_M.gguf",
-            # "/Users/dmiles/.lmstudio/models/lmstudio-community/Qwen3-32B-GGUF",
-        )
+    model, tokenizer, model_type = load_quantized_llm_model(
+        device,
+        "/Users/dmiles/.lmstudio/models/lmstudio-community/Olmo-3-32B-Think-MLX-4bit",
+        #"/Users/dmiles/.lmstudio/models/lmstudio-community/Olmo-3-32B-Think-GGUF/Olmo-3-32B-Think-Q4_K_M.gguf",
+        # "/Users/dmiles/.lmstudio/models/lmstudio-community/Qwen3-32B-GGUF",
+    )
+    # Read transcript once
+    transcript = ""
+    with open("Portland City Council Meeting AM Session 04⧸24⧸24 [6I7SlDJt17E]_transcript.txt", "r") as fl:
+        transcript = fl.read()
+    header_pat = re.compile(r"^\[\d\d:\d\d:\d\d - \d\d:\d\d:\d\d\].*:$", re.MULTILINE)
+    headers = header_pat.findall(transcript)
+    header_idxes = [transcript.index(x) for x in headers]
+    sections = [transcript[header_idxes[i]:header_idxes[i+1]] for i in range(len(header_idxes)-1)]
+    
+    # Create sliding window segments with ~50% overlap
+    transcript_segments = []
+    i = 0
+    while i < len(sections):
+        # Build current segment starting at index i
+        transcript_segment = ""
+        section_start_idx = i
+        section_count = 0
         
-        # Read transcript once
-        transcript = ""
-        with open("Portland City Council Meeting AM Session 04⧸24⧸24 [6I7SlDJt17E]_transcript.txt", "r") as fl:
-            transcript = fl.read()
+        # Accumulate sections until we exceed 4000 characters
+        while i < len(sections):
+            transcript_segment += sections[i]
+            i += 1
+            section_count += 1
+            if len(transcript_segment) > 6000:
+                break
         
-        # Initialize conversation with transcript as context
-        conversation = []
+        transcript_segments.append(transcript_segment)
         
-        # System message (optional) sets the assistant's behavior
-        conversation.append({
-            "role": "system",
-            "content": "You are a political analyst helping to extract information from city council meeting transcripts."
-        })
+        # Rewind to approximately the midpoint of this segment for overlap
+        # Calculate how many sections to go back (about half)
+        rewind_amount = section_count // 2
+        i = section_start_idx + rewind_amount
         
-        # First user message establishes the transcript as context
-        conversation.append({
-            "role": "user",
-            "content": f"""I'm going to provide you with a city council meeting transcript. Please read it carefully as I'll be asking you questions about it.
+        # Edge case: if we're at the end and rewinding would repeat the last segment
+        # just break to avoid infinite loop
+        if i >= len(sections) or rewind_amount == 0:
+            break
+
+    for transcript_segment in transcript_segments:
+        try:
+
+            # Initialize conversation with transcript as context
+            conversation = []
+
+            # System message (optional) sets the assistant's behavior
+            conversation.append({
+                "role": "system",
+                "content": "You are a political analyst helping to extract information from city council meeting transcripts."
+            })
+
+            # First user message establishes the transcript as context
+            conversation.append({
+                "role": "user",
+                "content": f"""I'm going to provide you with a city council meeting transcript. Please read it carefully as I'll be asking you questions about it.
 
 ```transcript
-{transcript}
+{transcript_segment}
 ```
 
 Please confirm you've read the transcript and are ready to analyze it."""
-        })
-        
-        # Get confirmation (optional, but helps establish context)
-        confirmation = quantized_generate_from_messages(conversation, model, tokenizer, model_type)
-        print("Assistant confirmation:", confirmation[:200], "...\n")
-        
-        # Add assistant's response to conversation history
-        conversation.append({
-            "role": "assistant",
-            "content": confirmation
-        })
-        
-        # Now ask for the political issues analysis
-        conversation.append({
-            "role": "user",
-            "content": """Now, please determine all political issues being discussed in the transcript. 
-Output a list of issues in graph format:
+            })
+
+            # Get confirmation (optional, but helps establish context)
+            print("reading transcript")
+            confirmation = quantized_generate_from_messages(conversation, model, tokenizer, model_type)
+            #print("Assistant confirmation:", confirmation[:200], "...\n")
+
+            # Add assistant's response to conversation history
+            conversation.append({
+                "role": "assistant",
+                "content": confirmation
+            })
+
+            # Now ask for the political issues analysis
+            conversation.append({
+                "role": "user",
+                "content": """Now, please determine all political issues being discussed in the transcript. 
+Format your response in a text block starting with ```graph.
+contents of the graph block should look like this:
 | Person -> Supports/Opposes -> Issue |
 
 For example:
 | Mayor Hales -> Supports -> Tenant Protections |
+"""
+            })
 
-Please explain your thinking then indicate your graph-formatted response in a text block starting with ```graph"""
-        })
-        
-        generated = quantized_generate_from_messages(conversation, model, tokenizer, model_type)
-        print("Issues analysis:", generated[:500], "...\n")
-        
-        # Add to conversation history
-        conversation.append({
-            "role": "assistant",
-            "content": generated
-        })
-        
-        # Parse the graph
-        start_delim = "```graph\n"
-        end_delim = "```"
-        answer = get_answer(generated, start_delim, end_delim)
-        print("Extracted graph:\n", answer, "\n")
-        
-        pat = re.compile(r"^\s*|\s*([^|]*) -> (.*) -> ([^|]*)\s*|\s*$")
-        
-        # Create a base conversation context that stops after the graph extraction
-        # This prevents the context from growing with each topic description
-        base_conversation = conversation.copy()
-        
-        for entity, relationship, topic in pat.findall(answer):
-            print(f"{entity=} {relationship=} {topic=}")
-            
-            if entity == "Person" or not (entity and relationship and topic):
-                continue
-            
-            # EFFICIENT APPROACH: Use temporary concatenation instead of appending
-            # This keeps context constant size rather than growing with each topic
-            # Since each topic description is independent, we don't need previous descriptions
-            description_generated = quantized_generate_from_messages(
-                base_conversation + [{
-                    "role": "user",
-                    "content": f"""You identified the topic "{topic}" from the transcript. Please create a detailed description of this topic based on the information in the transcript. Explain your thinking then write your description in a text block starting with ```description"""
-                }],
-                model, tokenizer, model_type
-            )
-            
-            print(f"\n{'='*80}")
-            print(f"Topic: {topic}")
-            print(f"Description: {description_generated}")
-            print('='*80 + "\n")
-            
-            # Note: We're NOT appending to conversation here because each topic 
-            # description is independent and doesn't need to see other topics
+            answer_tries = 3
+            answer: str = ""
+            generated: str = ""
+            while answer_tries > 0:
+                print("determining issues")
+                generated = quantized_generate_from_messages(conversation, model, tokenizer, model_type)
+                # Parse the graph
+                try:
+                    answer = get_answer(generated, start_delim="```graph\n", end_delim="```")
+                    print(answer)
+                except IndexError:
+                    # try again
+                    answer_tries -= 1
+                    continue
+                break
+            if not generated or not answer:
+                raise ValueError("tried to generate answer too many times")
+            # Add to conversation history
+            conversation.append({
+                "role": "assistant",
+                "content": generated
+            })
 
-    finally:
-        pass
+            pat = re.compile(r"^\s*|\s*([^|]*) -> (.*) -> ([^|]*)\s*|\s*$")
+
+            # Create a base conversation context that stops after the graph extraction
+            # This prevents the context from growing with each topic description
+            base_conversation = conversation.copy()
+
+            seen_topics = set()
+            for entity, relationship, topic in pat.findall(answer):
+                if entity == "Person" or not (entity and relationship and topic):
+                    continue
+                if topic in seen_topics:
+                    continue
+                seen_topics.add(topic)
+                print(f"{entity=} {relationship=} {topic=}")
+
+                # EFFICIENT APPROACH: Use temporary concatenation instead of appending
+                # This keeps context constant size rather than growing with each topic
+                # Since each topic description is independent, we don't need previous descriptions
+                tries_left = 3
+                description = ""
+                while tries_left > 0:
+                    description_generated = quantized_generate_from_messages(
+                        base_conversation + [{
+                            "role": "user",
+                            "content": f"""You identified the topic "{topic}" from the transcript.
+Please create a     detailed description of this topic based on the information in the transcript.
+Write your descr    iption in a text block starting with ```description"""
+                        }],
+                        model, tokenizer, model_type
+                    )
+                    try:
+                        description = get_answer(description_generated, start_delim="```description", end_delim="```")
+                    except IndexError:
+                        tries_left -= 1
+                        continue
+                    if not description:
+                        raise ValueError("could not generate description in 3 tries")
+                    print(description)
+
+                # Note: We're NOT appending to conversation here because each topic
+                # description is independent and doesn't need to see other topics
+
+        finally:
+            pass
 
 if __name__ == '__main__':
     main()
