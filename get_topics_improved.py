@@ -61,7 +61,7 @@ def main():
         #"/Users/dmiles/.lmstudio/models/lmstudio-community/Olmo-3-32B-Think-GGUF/Olmo-3-32B-Think-Q4_K_M.gguf",
         #"/Users/dmiles/.lmstudio/models/lmstudio-community/Qwen3-32B-GGUF",
         #"/Users/dmiles/.lmstudio/models/lmstudio-community/gpt-oss-20b-GGUF/gpt-oss-20b-MXFP4.gguf",
-        "/Users/dmiles/Qwen3-32B-Q4_K_M.gguf",
+        "/home/dmiles/Qwen3-32B-Q4_K_M.gguf",
     )
     # Read transcript once
     transcript = ""
@@ -86,7 +86,7 @@ def main():
             transcript_segment += sections[i]
             i += 1
             section_count += 1
-            if len(transcript_segment) > 6000:
+            if len(transcript_segment) > 30000:
                 break
         
         transcript_segments.append(transcript_segment)
@@ -188,11 +188,17 @@ description goes here
                         description = get_answer(description_generated, start_delim="```description", end_delim="```")
                         break
                     except IndexError:
+                        print("*"*80)
+                        print("failed to find ```description section:")
+                        print(description_generated)
+                        print("*"*80)
                         tries_left -= 1
                         continue
                 if not description:
                     raise ValueError("could not generate description in 3 tries")
+                print("*"*80)
                 print(description)
+                print("*"*80)
 
                 # Note: We're NOT appending to conversation here because each topic
                 # description is independent and doesn't need to see other topics

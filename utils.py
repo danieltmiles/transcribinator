@@ -213,7 +213,8 @@ def load_quantized_llm_model(device: str, model_path: str = None):
             model = Llama(
                 model_path=model_path,
                 n_gpu_layers=-1,  # Use all GPU layers
-                n_ctx=8192,  # Context window size
+                # n_ctx=8192,  # Context window size
+                n_ctx=10240,  # Context window size
                 verbose=False
             )
             tokenizer = AutoTokenizer.from_pretrained("allenai/Olmo-3-32B-Think")
