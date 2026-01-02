@@ -58,8 +58,10 @@ def main():
         device,
         #"/Users/dmiles/.lmstudio/models/lmstudio-community/gpt-oss-20b-GGUF",
         #"/Users/dmiles/.lmstudio/models/lmstudio-community/Olmo-3-32B-Think-MLX-4bit",
-        "/Users/dmiles/.lmstudio/models/lmstudio-community/Olmo-3-32B-Think-GGUF/Olmo-3-32B-Think-Q4_K_M.gguf",
-        # "/Users/dmiles/.lmstudio/models/lmstudio-community/Qwen3-32B-GGUF",
+        #"/Users/dmiles/.lmstudio/models/lmstudio-community/Olmo-3-32B-Think-GGUF/Olmo-3-32B-Think-Q4_K_M.gguf",
+        #"/Users/dmiles/.lmstudio/models/lmstudio-community/Qwen3-32B-GGUF",
+        #"/Users/dmiles/.lmstudio/models/lmstudio-community/gpt-oss-20b-GGUF/gpt-oss-20b-MXFP4.gguf",
+        "/Users/dmiles/Qwen3-32B-Q4_K_M.gguf",
     )
     # Read transcript once
     transcript = ""
@@ -110,42 +112,20 @@ def main():
                 "role": "system",
                 "content": "You are a political analyst helping to extract information from city council meeting transcripts."
             })
-
-#             # First user message establishes the transcript as context
-#             conversation.append({
-#                 "role": "user",
-#                 "content": f"""I'm going to provide you with a city council meeting transcript. Please read it carefully as I'll be asking you questions about it.
-#
-# ```transcript
-# {transcript_segment}
-# ```
-#
-# Please confirm you've read the transcript and are ready to analyze it."""
-#             })
-#
-#             # Get confirmation (optional, but helps establish context)
-#             print("reading transcript")
-#             confirmation = quantized_generate_from_messages(conversation, model, tokenizer, model_type)
-#             #print("Assistant confirmation:", confirmation[:200], "...\n")
-#
-#             # Add assistant's response to conversation history
-#             conversation.append({
-#                 "role": "assistant",
-#                 "content": confirmation
-#             })
-
-            # Now ask for the political issues analysis
             conversation.append({
                 "role": "user",
-                "content": """Extract all political issues as relationships in this exact format:
+                "content": f"""Extract all political issues as relationships in this exact format:
 ```graph
-| Speaker -> Position -> Issue |
+| Speaker -> Supports/Opposes -> Issue |
 ```
 
 Rules:
 - One relationship per line
 - No additional explanation
 - Maximum 15 relationships
+```
+{transcript_segment}
+```
 """
             })
 
@@ -159,6 +139,7 @@ Rules:
                 try:
                     answer = get_answer(generated, start_delim="```graph\n", end_delim="```")
                     print(answer)
+                    break
                 except IndexError:
                     # try again
                     print(f"failed to find ```graph block in generated text:\n{generated}")
@@ -170,7 +151,7 @@ Rules:
             # Add to conversation history
             conversation.append({
                 "role": "assistant",
-                "content": generated
+                "content": f"""```graph\n{answer}\n```\n"""
             })
 
             pat = re.compile(r"^\s*|\s*([^|]*) -> (.*) -> ([^|]*)\s*|\s*$")
@@ -205,6 +186,7 @@ description goes here
                     )
                     try:
                         description = get_answer(description_generated, start_delim="```description", end_delim="```")
+                        break
                     except IndexError:
                         tries_left -= 1
                         continue

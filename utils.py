@@ -201,7 +201,7 @@ def load_quantized_llm_model(device: str, model_path: str = None):
             print(f"Error loading MLX model: {e}")
             raise
 
-    elif device == "cuda" or (device == "mps" and "GGUF" in model_path):
+    elif device == "cuda" or (device == "mps" and "GGUF" in model_path.upper()):
         # Import llama-cpp-python for NVIDIA CUDA hardware
         try:
             from llama_cpp import Llama
@@ -210,7 +210,6 @@ def load_quantized_llm_model(device: str, model_path: str = None):
 
             # Temporarily suppress llama.cpp warnings
             os.environ['LLAMA_LOG_DISABLE'] = '1'
-
             model = Llama(
                 model_path=model_path,
                 n_gpu_layers=-1,  # Use all GPU layers
@@ -300,7 +299,6 @@ def quantized_generate_from_prompt(prompt: str, model, tokenizer, model_type, ma
     elif model_type == "llamacpp":
         # llama-cpp-python streaming generation - stops naturally on EOS token
         try:
-            print("Generating response (streaming until EOS token)...")
             generated_text = ""
 
             # Stream the response with stream=True
