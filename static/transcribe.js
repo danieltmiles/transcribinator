@@ -7,32 +7,34 @@ let stageTextEl,
     progressBarTranscription, progressTextTranscription,
     progressBarCleanup, progressTextCleanup;
 let newTranscriptionButton, newTranscriptionWrapper;
+let speakerDialog, currentFile, websocket;
 
 document.addEventListener('DOMContentLoaded', () => {
-    const uploadArea = document.getElementById('uploadArea');
-    const progressContainer = document.getElementById('progressContainer');
-    const errorMessage = document.getElementById('errorMessage');
-    const transcriptContainer = document.getElementById('transcriptContainer');
-    const transcriptText = document.getElementById('transcriptText');
-    const copyButton = document.getElementById('copyButton');
-    const fileNameDisplay = document.getElementById('fileNameDisplay');
+    uploadArea = document.getElementById('uploadArea');
+    progressContainer = document.getElementById('progressContainer');
+    errorMessage = document.getElementById('errorMessage');
+    transcriptContainer = document.getElementById('transcriptContainer');
+    transcriptText = document.getElementById('transcriptText');
+    copyButton = document.getElementById('copyButton');
+    fileNameDisplay = document.getElementById('fileNameDisplay');
 
-    const speakerRenameDialog = document.getElementById('speakerRenameDialog');
-    const speakerInputs = document.getElementById('speakerInputs');
-    const cancelRename = document.getElementById('cancelRename');
-    const confirmRename = document.getElementById('confirmRename');
-    const renameSpeakersButton = document.getElementById('renameSpeakersButton');
+    speakerDialog = document.getElementById('speakerDialog');
+    speakerRenameDialog = document.getElementById('speakerRenameDialog');
+    speakerInputs = document.getElementById('speakerInputs');
+    cancelRename = document.getElementById('cancelRename');
+    confirmRename = document.getElementById('confirmRename');
+    renameSpeakersButton = document.getElementById('renameSpeakersButton');
 
-    const stageTextEl = document.getElementById('stageText');
-    const progressBarDiarization = document.getElementById('progressBarDiarization');
-    const progressTextDiarization = document.getElementById('progressTextDiarization');
-    const progressBarTranscription = document.getElementById('progressBarTranscription');
-    const progressTextTranscription = document.getElementById('progressTextTranscription');
-    const progressBarCleanup = document.getElementById('progressBarCleanup');
-    const progressTextCleanup = document.getElementById('progressTextCleanup');
+    stageTextEl = document.getElementById('stageText');
+    progressBarDiarization = document.getElementById('progressBarDiarization');
+    progressTextDiarization = document.getElementById('progressTextDiarization');
+    progressBarTranscription = document.getElementById('progressBarTranscription');
+    progressTextTranscription = document.getElementById('progressTextTranscription');
+    progressBarCleanup = document.getElementById('progressBarCleanup');
+    progressTextCleanup = document.getElementById('progressTextCleanup');
 
-    const newTranscriptionButton = document.getElementById('newTranscriptionButton');
-    const newTranscriptionWrapper = document.getElementById('newTranscriptionWrapper');
+    newTranscriptionButton = document.getElementById('newTranscriptionButton');
+    newTranscriptionWrapper = document.getElementById('newTranscriptionWrapper');
     if (newTranscriptionButton) {
         newTranscriptionButton.addEventListener('click', () => {
             window.location.reload();
@@ -100,7 +102,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (selectedFileNameEl) selectedFileNameEl.textContent = 'None selected';
     });
 
-    async function uploadFile(file, numSpeakers, fileName) {
+    async function uploadFile(file, fileName) {
         // Reset UI
         errorMessage.style.display = 'none';
         transcriptContainer.style.display = 'none';
@@ -112,7 +114,6 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             const formData = new FormData();
             formData.append('file', file);
-            formData.append('num_speakers', numSpeakers);
             formData.append('file_name', fileName);
     
             const response = await fetch(`${API_BASE}/upload`, {
@@ -206,11 +207,6 @@ document.addEventListener('DOMContentLoaded', () => {
     
     // Handle dialog buttons
     document.getElementById('confirmUpload').addEventListener('click', async () => {
-        const speakers = parseInt(numSpeakers.value);
-        if (speakers < 1 || speakers > 10) {
-            alert('Please enter a number between 1 and 10');
-            return;
-        }
         const fileName = document.getElementById('fileName').value.trim();
         speakerDialog.style.display = 'none';
         if (currentFile) {
@@ -226,7 +222,7 @@ document.addEventListener('DOMContentLoaded', () => {
               );
               currentFile = audioFile;
             }
-            uploadFile(currentFile, speakers, fileName);
+            uploadFile(currentFile, fileName);
             currentFile = null;
         }
     });
@@ -564,4 +560,3 @@ async function extractAudioFromVideo(videoFile) {
     
     loadPreviousTranscripts();
 });
-

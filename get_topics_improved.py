@@ -1,0 +1,210 @@
+import asyncio
+import re
+
+import torch
+from pathlib import Path
+
+from utils import load_quantized_llm_model, quantized_generate_from_prompt
+
+device = "cuda" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "cpu"
+
+def get_answer(generated: str, start_delim: str, end_delim: str) -> str:
+    begin_indexes = [i for i in range(len(generated)) if generated.startswith(start_delim, i)]
+    end_indexes = [i for i in range(len(generated)) if generated.startswith(end_delim, i)]
+    print(f"{begin_indexes=}")
+    print(f"{end_indexes=}")
+    return generated[begin_indexes[-1] + len(start_delim):end_indexes[-1]]
+
+def quantized_generate_from_messages(messages: list, model, tokenizer, model_type: str, **kwargs) -> str:
+    """
+    Generate text from a conversation history using chat templates.
+    
+    Args:
+        messages: List of message dicts with 'role' and 'content' keys
+                  e.g., [{"role": "user", "content": "..."}]
+        model: The loaded model
+        tokenizer: The tokenizer
+        model_type: Either "mlx" or "gguf"
+        **kwargs: Additional generation parameters
+    
+    Returns:
+        Generated text response
+    """
+    # Apply chat template to convert conversation to proper format
+    if hasattr(tokenizer, 'apply_chat_template'):
+        # Most modern tokenizers support this
+        prompt = tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+    elif hasattr(model, "create_chat_completion"):
+        return model.create_chat_completion(messages)
+    else:
+        # Fallback: manually format as simple conversation
+        prompt = ""
+        for msg in messages:
+            role = msg['role']
+            content = msg['content']
+            if role == 'system':
+                prompt += f"System: {content}\n\n"
+            elif role == 'user':
+                prompt += f"User: {content}\n\n"
+            elif role == 'assistant':
+                prompt += f"Assistant: {content}\n\n"
+        prompt += "Assistant: "
+    
+    return quantized_generate_from_prompt(prompt, model, tokenizer, model_type, **kwargs)
+
+def main():
+    model, tokenizer, model_type = load_quantized_llm_model(
+        device,
+        #"/Users/dmiles/.lmstudio/models/lmstudio-community/gpt-oss-20b-GGUF",
+        #"/Users/dmiles/.lmstudio/models/lmstudio-community/Olmo-3-32B-Think-MLX-4bit",
+        #"/Users/dmiles/.lmstudio/models/lmstudio-community/Olmo-3-32B-Think-GGUF/Olmo-3-32B-Think-Q4_K_M.gguf",
+        #"/Users/dmiles/.lmstudio/models/lmstudio-community/Qwen3-32B-GGUF",
+        #"/Users/dmiles/.lmstudio/models/lmstudio-community/gpt-oss-20b-GGUF/gpt-oss-20b-MXFP4.gguf",
+        "/home/dmiles/Qwen3-32B-Q4_K_M.gguf",
+    )
+    transcript_files = [str(f) for f in Path("./transcripts/").iterdir() if f.is_file()]
+
+    for transcript_file in transcript_files:
+        # Read transcript once
+        with open(transcript_file, "r") as fl:
+            transcript = fl.read()
+        header_pat = re.compile(r"^\[\d\d:\d\d:\d\d - \d\d:\d\d:\d\d\].*:$", re.MULTILINE)
+        headers = header_pat.findall(transcript)
+        header_idxes = [transcript.index(x) for x in headers]
+        sections = [transcript[header_idxes[i]:header_idxes[i+1]] for i in range(len(header_idxes)-1)]
+        
+        # Create sliding window segments with ~50% overlap
+        transcript_segments = []
+        i = 0
+        while i < len(sections):
+            # Build current segment starting at index i
+            transcript_segment = ""
+            section_start_idx = i
+            section_count = 0
+            
+            # Accumulate sections until we exceed 4000 characters
+            while i < len(sections):
+                transcript_segment += sections[i]
+                i += 1
+                section_count += 1
+                if len(transcript_segment) > 30000:
+                    break
+            
+            transcript_segments.append(transcript_segment)
+            
+            # Rewind to approximately the midpoint of this segment for overlap
+            # Calculate how many sections to go back (about half)
+            rewind_amount = section_count // 2
+            i = section_start_idx + rewind_amount
+            
+            # Edge case: if we're at the end and rewinding would repeat the last segment
+            # just break to avoid infinite loop
+            if i >= len(sections) or rewind_amount == 0:
+                break
+
+        for transcript_segment in transcript_segments:
+            # Initialize conversation with transcript as context
+            conversation = []
+
+            # System message (optional) sets the assistant's behavior
+            conversation.append({
+                "role": "system",
+                "content": "You are a political analyst helping to extract information from city council meeting transcripts."
+            })
+            conversation.append({
+                "role": "user",
+                "content": f"""Extract all political issues as relationships in this exact format:
+```graph
+| Speaker -> Supports/Opposes -> Issue |
+```
+
+Rules:
+- One relationship per line
+- No additional explanation
+- Maximum 15 relationships
+```
+{transcript_segment}
+```
+"""
+            })
+            answer_tries = 3
+            answer: str = ""
+            generated: str = ""
+            while answer_tries > 0:
+                print("determining issues")
+                generated = quantized_generate_from_messages(conversation, model, tokenizer, model_type)
+                # Parse the graph
+                try:
+                    answer = get_answer(generated, start_delim="```graph\n", end_delim="```")
+                    print(answer)
+                    break
+                except IndexError:
+                    # try again
+                    print(f"failed to find ```graph block in generated text:\n{generated}")
+                    answer_tries -= 1
+                    continue
+                break
+            if not generated or not answer:
+                raise ValueError("tried to generate answer too many times")
+            # Add to conversation history
+            conversation.append({
+                "role": "assistant",
+                "content": f"""```graph\n{answer}\n```\n"""
+            })
+
+            pat = re.compile(r"^\s*|\s*([^|]*) -> (.*) -> ([^|]*)\s*|\s*$")
+
+            # Create a base conversation context that stops after the graph extraction
+            # This prevents the context from growing with each topic description
+            base_conversation = conversation.copy()
+
+            seen_topics = set()
+            for entity, relationship, topic in pat.findall(answer):
+                if entity == "Person" or not (entity and relationship and topic):
+                    continue
+                if topic in seen_topics:
+                    continue
+                seen_topics.add(topic)
+                print(f"{entity=} {relationship=} {topic=}")
+
+                tries_left = 5
+                description = ""
+                while tries_left > 0:
+                    description_generated = quantized_generate_from_messages(
+                        base_conversation + [{
+                            "role": "user",
+                            "content": f"""You identified the topic "{topic}" from the transcript.
+Please create a detailed description of this topic based on the information in the transcript in this exact format:.
+```description
+description goes here
+```
+"""
+                        }],
+                        model, tokenizer, model_type
+                    )
+                    try:
+                        description = get_answer(description_generated, start_delim="```description", end_delim="```")
+                        break
+                    except IndexError:
+                        print("*"*80)
+                        print("failed to find ```description section:")
+                        print(description_generated)
+                        print("*"*80)
+                        tries_left -= 1
+                        continue
+                if not description:
+                    print(f"could not generate description in 5 tries:\n{description_generated}")
+                    print(f"=====================\n{description}\n===========================")
+                    raise ValueError("could not generate description in 5 tries")
+                print("*"*80)
+                print(description)
+                print("*"*80)
+
+                # Note: We're NOT appending to conversation here because each topic
+                # description is independent and doesn't need to see other topics
+if __name__ == '__main__':
+    main()

@@ -32,8 +32,12 @@ from starlette.responses import FileResponse, JSONResponse, RedirectResponse
 from starlette.websockets import WebSocketState
 
 from ai import process_audio as ai_process_audio
-from dao import save_transcription, init_db, get_jobs, update_job_status, create_connection
+from dao import (
+    save_transcription, init_db, get_jobs, update_job_status, create_connection,
+    enqueue_job, get_queue_status, get_job_queue_position
+)
 from utils import TranscriptionJob
+from job_queue_manager import JobQueueManager
 
 import re
 
@@ -46,11 +50,24 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.error("lifespan")
-    # Load the ML model
+    global job_queue_manager
+    logger.info("Starting application lifespan")
+    
+    # Initialize database
     init_db()
     init_auth_db()
+    
+    # Initialize and start job queue manager
+    job_queue_manager = JobQueueManager(active_jobs)
+    await job_queue_manager.start()
+    logger.info("Job queue manager started")
+    
     yield
+    
+    # Cleanup on shutdown
+    if job_queue_manager:
+        await job_queue_manager.stop()
+        logger.info("Job queue manager stopped")
 
 
 # Initialize FastAPI app
@@ -66,8 +83,9 @@ app.add_middleware(
 )
 
 
-# Store active jobs
+# Store active jobs and initialize job queue manager
 active_jobs: Dict[str, TranscriptionJob] = {}
+job_queue_manager: Optional[JobQueueManager] = None
 
 
 class CustomHTTPBearer(HTTPBearer):
@@ -110,7 +128,7 @@ UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 
-async def process_audio(job_id: str, file_path: Path, num_speakers: int):
+async def process_audio(job_id: str, file_path: Path):
     """
     Process audio file and send progress updates via WebSocket.
     Replace the sleep calls with your actual AI model processing.
@@ -139,7 +157,7 @@ async def process_audio(job_id: str, file_path: Path, num_speakers: int):
         #     raise exc
         try:
             async with create_task_group() as tg:
-                tg.start_soon(ai_process_audio, file_path, num_speakers, 1.0, progress_send_stream, transcript_send_stream)
+                tg.start_soon(ai_process_audio, file_path, 1.0, progress_send_stream, transcript_send_stream)
                 stage_progress = {"diarization": 0, "transcription": 0, "cleanup": 0}
                 cleanup_done = False
                 while not cleanup_done:
@@ -308,9 +326,7 @@ async def read_transcribe():
 async def upload_file(
         user: User = Depends(get_current_user),
         file: UploadFile = File(...),
-        num_speakers: int = Form(...),
-        file_name: str = Form(...),
-        background_tasks: BackgroundTasks = None):
+        file_name: str = Form(...)):
     # Generate unique job ID
     job_id = str(uuid.uuid4())
 
@@ -326,16 +342,25 @@ async def upload_file(
         job_id=job_id,
         filename=file.filename,
         human_readable_filename=file_name,
-        status="uploaded",
+        status="queued",  # Changed from "uploaded" to "queued"
         progress=0,
     )
     active_jobs[job_id] = job
     save_transcription(job, user.email)
 
-    # Start processing in background
-    background_tasks.add_task(process_audio, job_id, file_path, num_speakers)
+    # Add job to processing queue instead of background task
+    enqueue_job(job_id, str(file_path))
+    
+    # Get queue position for user feedback
+    queue_position = get_job_queue_position(job_id)
+    
+    logger.info(f"Job {job_id} queued for processing (position: {queue_position})")
 
-    return {"job_id": job_id}
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "queue_position": queue_position
+    }
 
 
 
@@ -402,11 +427,54 @@ async def get_job_status(job_id: str):
         return {"error": "Job not found"}, 404
 
     job = active_jobs[job_id]
+    
+    # Get queue position if job is queued
+    queue_position = None
+    if job.status == "queued":
+        queue_position = get_job_queue_position(job_id)
+    
     return {
         "job_id": job.job_id,
         "status": job.status,
         "progress": job.progress,
         "filename": job.filename,
+        "queue_position": queue_position
+    }
+
+
+@app.get("/queue/status")
+async def get_queue_status_endpoint():
+    """Get overall queue status and statistics."""
+    queue_status = get_queue_status()
+    manager_status = job_queue_manager.get_status() if job_queue_manager else None
+    
+    return {
+        "queue_statistics": queue_status,
+        "manager_status": manager_status
+    }
+
+
+@app.get("/queue/position/{job_id}")
+async def get_job_position(job_id: str):
+    """Get the queue position of a specific job."""
+    position = get_job_queue_position(job_id)
+    
+    if position is None:
+        # Job might not be queued or doesn't exist
+        if job_id in active_jobs:
+            job = active_jobs[job_id]
+            return {
+                "job_id": job_id,
+                "status": job.status,
+                "queue_position": None,
+                "message": f"Job is {job.status}, not in queue"
+            }
+        else:
+            raise HTTPException(status_code=404, detail="Job not found")
+    
+    return {
+        "job_id": job_id,
+        "queue_position": position
     }
 
 
@@ -541,20 +609,6 @@ async def login(user: UserCreate, request: Request):
     )
     return response
 
-# Modify your existing endpoints to require authentication
-@app.get("/")
-async def read_root(user: User = Depends(get_current_user)):
-    return FileResponse("static/transcribe.html")
-
-@app.post("/upload")
-async def upload_file(
-        file: UploadFile = File(...),
-        num_speakers: int = Form(...),
-        file_name: str = Form(...),
-        background_tasks: BackgroundTasks = None,
-        user: User = Depends(get_current_user)):
-    # Your existing upload code here
-    pass
 
 
 
@@ -563,5 +617,3 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
