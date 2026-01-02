@@ -306,7 +306,7 @@ def quantized_generate_from_prompt(prompt: str, model, tokenizer, model_type, ma
             stream = model(
                 prompt,
                 max_tokens=max_tokens,  # Acts as safety limit
-                temperature=0.5,
+                temperature=0.7,
                 # top_p=0.9,
                 # top_k=40,
                 repeat_penalty=1.1,
